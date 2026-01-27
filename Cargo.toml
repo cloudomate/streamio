@@ -1,0 +1,41 @@
+[package]
+name = "horizon-streamer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GPU rendering
+wgpu = "23"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+parking_lot = "0.12"
+
+# GStreamer for WebRTC streaming
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-webrtc = "0.23"
+gstreamer-sdp = "0.23"
+gstreamer-video = "0.23"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web server
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+
+# Input simulation
+enigo = "0.2"
+
+[profile.release]
+opt-level = 3

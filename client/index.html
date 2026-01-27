@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Horizon Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #1a1a2e;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: #16213e;
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #0f3460;
+        }
+
+        .header h1 {
+            color: #e94560;
+            font-size: 18px;
+            font-weight: 500;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #a0a0a0;
+            font-size: 13px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ff6b6b;
+        }
+
+        .status-dot.connected {
+            background: #51cf66;
+        }
+
+        .viewer-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        #video {
+            max-width: 100%;
+            max-height: 100%;
+            min-width: 640px;
+            min-height: 360px;
+            background: #000;
+            cursor: grab;
+            object-fit: contain;
+        }
+
+        #video:active {
+            cursor: grabbing;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 8px;
+            background: rgba(22, 33, 62, 0.9);
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+        }
+
+        .controls button {
+            background: #0f3460;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            transition: background 0.2s;
+        }
+
+        .controls button:hover {
+            background: #e94560;
+        }
+
+        .stats {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: #51cf66;
+            font-family: monospace;
+            font-size: 12px;
+            padding: 8px 12px;
+            border-radius: 4px;
+        }
+
+        .instructions {
+            position: absolute;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #a0a0a0;
+            font-size: 12px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Horizon Viewer</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Connecting...</span>
+        </div>
+    </div>
+
+    <div class="viewer-container">
+        <video id="video" autoplay playsinline muted></video>
+        <div id="fallback" style="display:none; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:#ff6b6b; text-align:center;">
+            <div style="font-size:24px; margin-bottom:10px;">Video not received</div>
+            <div style="font-size:14px; color:#a0a0a0;">Check browser console for details</div>
+        </div>
+
+        <div class="stats" id="stats">
+            Latency: -- ms<br>
+            FPS: --
+        </div>
+
+        <div class="instructions">
+            Left-drag: Rotate | Scroll: Zoom | Middle-drag: Pan | R: Reset
+        </div>
+
+        <div class="controls">
+            <button onclick="resetCamera()">Reset View</button>
+            <button onclick="toggleStats()">Toggle Stats</button>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const statsEl = document.getElementById('stats');
+
+        let ws = null;
+        let pc = null;
+        let isDragging = false;
+        let lastX = 0, lastY = 0;
+        let dragButton = 0;
+
+        // Stats tracking
+        let frameCount = 0;
+        let lastStatsTime = Date.now();
+
+        function connect() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Connected';
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+                statusDot.classList.remove('connected');
+                statusText.textContent = 'Disconnected';
+
+                // Reconnect after delay
+                setTimeout(connect, 2000);
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+                console.log('Received:', msg.type);
+
+                switch (msg.type) {
+                    case 'offer':
+                        await handleOffer(msg.sdp);
+                        break;
+                    case 'ice':
+                        await handleIceCandidate(msg);
+                        break;
+                }
+            };
+        }
+
+        async function handleOffer(sdp) {
+            // Create peer connection
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+            });
+
+            // Handle incoming track
+            pc.ontrack = (event) => {
+                console.log('Received track:', event.track.kind, event.streams);
+                if (event.track.kind === 'video') {
+                    video.srcObject = event.streams[0];
+                    console.log('Video stream set, readyState:', video.readyState);
+                    // Try to play explicitly
+                    video.play().then(() => {
+                        console.log('Video playing');
+                    }).catch(e => {
+                        console.error('Play failed:', e);
+                    });
+                }
+            };
+
+            // Monitor video element state
+            video.onloadedmetadata = () => {
+                console.log('Video metadata loaded:', video.videoWidth, 'x', video.videoHeight);
+            };
+            video.oncanplay = () => {
+                console.log('Video can play');
+            };
+            video.onerror = (e) => {
+                console.error('Video error:', e);
+            };
+
+            // Handle ICE candidates
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        type: 'ice',
+                        candidate: event.candidate.candidate,
+                        sdp_m_line_index: event.candidate.sdpMLineIndex
+                    }));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log('Connection state:', pc.connectionState);
+                if (pc.connectionState === 'connected') {
+                    statusText.textContent = 'Streaming';
+                    // Log transceivers
+                    const transceivers = pc.getTransceivers();
+                    console.log('Transceivers:', transceivers.length);
+                    transceivers.forEach((t, i) => {
+                        console.log(`Transceiver ${i}:`, t.direction, t.receiver?.track?.kind);
+                    });
+                }
+            };
+
+            pc.onicegatheringstatechange = () => {
+                console.log('ICE gathering state:', pc.iceGatheringState);
+            };
+
+            // Set remote description
+            await pc.setRemoteDescription({ type: 'offer', sdp });
+
+            // Create and send answer
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            ws.send(JSON.stringify({
+                type: 'answer',
+                sdp: answer.sdp
+            }));
+        }
+
+        async function handleIceCandidate(msg) {
+            if (pc && msg.candidate) {
+                try {
+                    await pc.addIceCandidate({
+                        candidate: msg.candidate,
+                        sdpMLineIndex: msg.sdp_m_line_index
+                    });
+                } catch (e) {
+                    console.error('Failed to add ICE candidate:', e);
+                }
+            }
+        }
+
+        // Input handling
+        video.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            dragButton = e.button;
+            lastX = e.clientX;
+            lastY = e.clientY;
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+
+            const dx = e.clientX - lastX;
+            const dy = e.clientY - lastY;
+            lastX = e.clientX;
+            lastY = e.clientY;
+
+            if (dragButton === 0) {
+                // Left button: rotate
+                sendInput({ type: 'rotate', dx, dy });
+            } else if (dragButton === 1) {
+                // Middle button: pan
+                sendInput({ type: 'pan', dx, dy });
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        video.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const delta = -e.deltaY / 100;
+            sendInput({ type: 'zoom', delta });
+        }, { passive: false });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'r' || e.key === 'R') {
+                resetCamera();
+            }
+        });
+
+        // Prevent context menu on video
+        video.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        function sendInput(event) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(event));
+            }
+        }
+
+        function resetCamera() {
+            sendInput({ type: 'reset' });
+        }
+
+        function toggleStats() {
+            statsEl.style.display = statsEl.style.display === 'none' ? 'block' : 'none';
+        }
+
+        // Update stats
+        video.addEventListener('timeupdate', () => {
+            frameCount++;
+        });
+
+        setInterval(() => {
+            const now = Date.now();
+            const elapsed = (now - lastStatsTime) / 1000;
+            const fps = frameCount / elapsed;
+
+            statsEl.innerHTML = `FPS: ${fps.toFixed(1)}`;
+
+            frameCount = 0;
+            lastStatsTime = now;
+        }, 1000);
+
+        // Start connection
+        connect();
+
+        // Check for video after 5 seconds
+        setTimeout(() => {
+            if (video.videoWidth === 0) {
+                document.getElementById('fallback').style.display = 'block';
+                console.log('Video not playing after 5 seconds');
+                console.log('Video element state:', {
+                    srcObject: video.srcObject,
+                    readyState: video.readyState,
+                    networkState: video.networkState,
+                    paused: video.paused,
+                    currentTime: video.currentTime
+                });
+            }
+        }, 5000);
+    </script>
+</body>
+</html>

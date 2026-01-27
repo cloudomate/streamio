@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Screen Stream</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0d1117;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: #161b22;
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #30363d;
+        }
+        .header h1 {
+            color: #58a6ff;
+            font-size: 16px;
+            font-weight: 500;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #8b949e;
+            font-size: 13px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #f85149;
+        }
+        .status-dot.connected { background: #3fb950; }
+        .video-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+            position: relative;
+        }
+        #video {
+            max-width: 100%;
+            max-height: 100%;
+            background: #000;
+        }
+        .controls {
+            background: #161b22;
+            padding: 8px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            border-top: 1px solid #30363d;
+        }
+        .controls button {
+            background: #21262d;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .controls button:hover {
+            background: #30363d;
+        }
+        .stats {
+            color: #8b949e;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Screen Stream (VDI)</h1>
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Connecting...</span>
+        </div>
+    </div>
+
+    <div class="video-container" id="videoContainer">
+        <video id="video" autoplay playsinline muted></video>
+    </div>
+
+    <div class="controls">
+        <button onclick="toggleFullscreen()">Fullscreen</button>
+        <button onclick="reconnect()">Reconnect</button>
+        <span class="stats" id="stats">--</span>
+        <span class="stats" id="coords">--</span>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const statsEl = document.getElementById('stats');
+        const coordsEl = document.getElementById('coords');
+
+        let ws = null;
+        let pc = null;
+        let connecting = false;
+
+        function connect() {
+            if (connecting || (ws && ws.readyState === WebSocket.OPEN)) {
+                console.log('Already connected or connecting');
+                return;
+            }
+            connecting = true;
+
+            // Clean up existing connections
+            if (pc) { pc.close(); pc = null; }
+            if (ws) { ws.close(); ws = null; }
+
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                statusText.textContent = 'Connected';
+                connecting = false;
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+                statusDot.classList.remove('connected');
+                statusText.textContent = 'Disconnected';
+                connecting = false;
+                if (pc) { pc.close(); pc = null; }
+                // Only reconnect if not manually disconnected
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                connecting = false;
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+                console.log('Received:', msg.type);
+
+                if (msg.type === 'offer') {
+                    await handleOffer(msg.sdp);
+                } else if (msg.type === 'ice') {
+                    await handleIce(msg);
+                }
+            };
+        }
+
+        async function handleOffer(sdp) {
+            pc = new RTCPeerConnection({
+                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+            });
+
+            pc.ontrack = (event) => {
+                console.log('Track received:', event.track.kind);
+                if (event.track.kind === 'video') {
+                    video.srcObject = event.streams[0];
+                    video.play().catch(e => console.error('Play error:', e));
+                }
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        type: 'ice',
+                        candidate: event.candidate.candidate,
+                        sdp_mid: event.candidate.sdpMid,
+                        sdp_m_line_index: event.candidate.sdpMLineIndex
+                    }));
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                console.log('Connection state:', pc.connectionState);
+                if (pc.connectionState === 'connected') {
+                    statusDot.classList.add('connected');
+                    statusText.textContent = 'Streaming';
+                }
+            };
+
+            await pc.setRemoteDescription({ type: 'offer', sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        }
+
+        async function handleIce(msg) {
+            if (pc && msg.candidate) {
+                try {
+                    await pc.addIceCandidate({
+                        candidate: msg.candidate,
+                        sdpMid: msg.sdp_mid,
+                        sdpMLineIndex: msg.sdp_m_line_index
+                    });
+                } catch (e) {
+                    console.error('ICE error:', e);
+                }
+            }
+        }
+
+        function toggleFullscreen() {
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                video.requestFullscreen();
+            }
+        }
+
+        function reconnect() {
+            connecting = false;
+            if (ws) ws.close();
+            if (pc) pc.close();
+            ws = null;
+            pc = null;
+            setTimeout(connect, 500);
+        }
+
+        // Input handling - send mouse/keyboard to server
+        function sendInput(event) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(event));
+            }
+        }
+
+        // Get coordinates relative to actual video
+        // On macOS Retina, screen capture is at 2x but coordinates are in points
+        // We need to divide by devicePixelRatio to get the correct screen coordinates
+        function getVideoCoords(e) {
+            const rect = video.getBoundingClientRect();
+            const videoWidth = video.videoWidth || 1920;
+            const videoHeight = video.videoHeight || 1080;
+
+            // Calculate position within video element
+            const relX = e.clientX - rect.left;
+            const relY = e.clientY - rect.top;
+
+            // Scale to video resolution
+            const scaleX = videoWidth / rect.width;
+            const scaleY = videoHeight / rect.height;
+
+            // On Retina displays, divide by 2 (or devicePixelRatio) to convert to screen points
+            // The capture is at native resolution but mouse coordinates are in points
+            const dpr = window.devicePixelRatio || 1;
+
+            return {
+                x: Math.round((relX * scaleX) / dpr),
+                y: Math.round((relY * scaleY) / dpr)
+            };
+        }
+
+        // Mouse events
+        video.addEventListener('mousedown', (e) => {
+            const coords = getVideoCoords(e);
+            sendInput({ type: 'mouse_down', button: e.button, x: coords.x, y: coords.y });
+            e.preventDefault();
+        });
+
+        video.addEventListener('mouseup', (e) => {
+            const coords = getVideoCoords(e);
+            sendInput({ type: 'mouse_up', button: e.button, x: coords.x, y: coords.y });
+            e.preventDefault();
+        });
+
+        video.addEventListener('mousemove', (e) => {
+            const coords = getVideoCoords(e);
+            sendInput({ type: 'mouse_move', x: coords.x, y: coords.y });
+            // Show debug info
+            coordsEl.textContent = `${coords.x},${coords.y} | vid:${video.videoWidth}x${video.videoHeight} | dpr:${window.devicePixelRatio}`;
+        });
+
+        video.addEventListener('wheel', (e) => {
+            sendInput({ type: 'scroll', dx: e.deltaX, dy: e.deltaY });
+            e.preventDefault();
+        }, { passive: false });
+
+        video.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        // Keyboard events - capture on document level for reliability
+        video.tabIndex = 0; // Make video focusable
+
+        // Auto-focus video when clicking
+        video.addEventListener('click', () => video.focus());
+
+        // Capture keyboard globally when video has focus or mouse is over it
+        let videoHasFocus = false;
+
+        video.addEventListener('mouseenter', () => { videoHasFocus = true; video.focus(); });
+        video.addEventListener('mouseleave', () => { videoHasFocus = false; });
+        video.addEventListener('focus', () => { videoHasFocus = true; });
+        video.addEventListener('blur', () => { videoHasFocus = false; });
+
+        document.addEventListener('keydown', (e) => {
+            if (videoHasFocus) {
+                sendInput({ type: 'key_down', key: e.key, code: e.code, modifiers: getModifiers(e) });
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (videoHasFocus) {
+                sendInput({ type: 'key_up', key: e.key, code: e.code, modifiers: getModifiers(e) });
+                e.preventDefault();
+            }
+        });
+
+        function getModifiers(e) {
+            return {
+                shift: e.shiftKey,
+                ctrl: e.ctrlKey,
+                alt: e.altKey,
+                meta: e.metaKey
+            };
+        }
+
+        // Stats
+        setInterval(() => {
+            if (pc) {
+                pc.getStats().then(stats => {
+                    stats.forEach(report => {
+                        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                            const fps = report.framesPerSecond || 0;
+                            statsEl.textContent = `${fps.toFixed(0)} fps | ${report.framesDecoded || 0} frames`;
+                        }
+                    });
+                });
+            }
+        }, 1000);
+
+        connect();
+    </script>
+</body>
+</html>
