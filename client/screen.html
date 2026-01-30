@@ -47,11 +47,13 @@
             justify-content: center;
             background: #000;
             position: relative;
+            cursor: none;  /* Hide local cursor - remote cursor is visible in stream */
         }
         #video {
             max-width: 100%;
             max-height: 100%;
             background: #000;
+            cursor: none;
         }
         .controls {
             background: #161b22;
@@ -91,11 +93,13 @@
     </div>
 
     <div class="video-container" id="videoContainer">
-        <video id="video" autoplay playsinline muted></video>
+        <video id="video" autoplay playsinline></video>
     </div>
 
     <div class="controls">
         <button onclick="toggleFullscreen()">Fullscreen</button>
+        <button onclick="toggleAudio()" id="audioBtn">Unmute</button>
+        <button onclick="toggleMic()" id="micBtn">Mic Off</button>
         <button onclick="reconnect()">Reconnect</button>
         <span class="stats" id="stats">--</span>
         <span class="stats" id="coords">--</span>
@@ -159,6 +163,8 @@
             };
         }
 
+        let localStream = null;
+
         async function handleOffer(sdp) {
             pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
@@ -168,9 +174,28 @@
                 console.log('Track received:', event.track.kind);
                 if (event.track.kind === 'video') {
                     video.srcObject = event.streams[0];
-                    video.play().catch(e => console.error('Play error:', e));
+                    // Try to play, may need user interaction for audio
+                    video.play().catch(e => {
+                        console.log('Autoplay blocked, click to unmute');
+                        video.muted = true;
+                        video.play();
+                    });
+                } else if (event.track.kind === 'audio') {
+                    console.log('Remote audio track received');
+                    // Audio is part of the same stream as video
                 }
             };
+
+            // Request microphone access and add to connection
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                localStream.getTracks().forEach(track => {
+                    pc.addTrack(track, localStream);
+                    console.log('Added local audio track:', track.kind);
+                });
+            } catch (e) {
+                console.log('Microphone access denied or not available:', e.message);
+            }
 
             pc.onicecandidate = (event) => {
                 if (event.candidate) {
@@ -220,6 +245,21 @@
             }
         }
 
+        function toggleAudio() {
+            video.muted = !video.muted;
+            document.getElementById('audioBtn').textContent = video.muted ? 'Unmute' : 'Mute';
+        }
+
+        function toggleMic() {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    audioTrack.enabled = !audioTrack.enabled;
+                    document.getElementById('micBtn').textContent = audioTrack.enabled ? 'Mic Off' : 'Mic On';
+                }
+            }
+        }
+
         function reconnect() {
             connecting = false;
             if (ws) ws.close();
@@ -236,50 +276,78 @@
             }
         }
 
-        // Get coordinates relative to actual video
-        // On macOS Retina, screen capture is at 2x but coordinates are in points
-        // We need to divide by devicePixelRatio to get the correct screen coordinates
+        // Get coordinates relative to actual video content
+        // Handles letterboxing and aspect ratio differences
+        // GStreamer avfvideosrc captures at point resolution, so no DPR adjustment needed
         function getVideoCoords(e) {
             const rect = video.getBoundingClientRect();
             const videoWidth = video.videoWidth || 1920;
             const videoHeight = video.videoHeight || 1080;
 
-            // Calculate position within video element
-            const relX = e.clientX - rect.left;
-            const relY = e.clientY - rect.top;
+            // Calculate actual video display size (accounting for aspect ratio)
+            const videoAspect = videoWidth / videoHeight;
+            const rectAspect = rect.width / rect.height;
 
-            // Scale to video resolution
-            const scaleX = videoWidth / rect.width;
-            const scaleY = videoHeight / rect.height;
+            let displayWidth, displayHeight, offsetX, offsetY;
+            if (rectAspect > videoAspect) {
+                // Letterboxed horizontally (black bars on sides)
+                displayHeight = rect.height;
+                displayWidth = rect.height * videoAspect;
+                offsetX = (rect.width - displayWidth) / 2;
+                offsetY = 0;
+            } else {
+                // Letterboxed vertically (black bars on top/bottom)
+                displayWidth = rect.width;
+                displayHeight = rect.width / videoAspect;
+                offsetX = 0;
+                offsetY = (rect.height - displayHeight) / 2;
+            }
 
-            // On Retina displays, divide by 2 (or devicePixelRatio) to convert to screen points
-            // The capture is at native resolution but mouse coordinates are in points
-            const dpr = window.devicePixelRatio || 1;
+            // Calculate position within the actual video content
+            const relX = e.clientX - rect.left - offsetX;
+            const relY = e.clientY - rect.top - offsetY;
+
+            // Check if click is within video content area
+            if (relX < 0 || relX > displayWidth || relY < 0 || relY > displayHeight) {
+                return null;  // Click outside video content
+            }
+
+            // Scale to video resolution (which is in screen points on macOS)
+            const scaleX = videoWidth / displayWidth;
+            const scaleY = videoHeight / displayHeight;
 
             return {
-                x: Math.round((relX * scaleX) / dpr),
-                y: Math.round((relY * scaleY) / dpr)
+                x: Math.round(relX * scaleX),
+                y: Math.round(relY * scaleY)
             };
         }
 
-        // Mouse events
-        video.addEventListener('mousedown', (e) => {
+        // Mouse events - use video container for better event capture
+        const videoContainer = document.getElementById('videoContainer');
+
+        videoContainer.addEventListener('mousedown', (e) => {
             const coords = getVideoCoords(e);
-            sendInput({ type: 'mouse_down', button: e.button, x: coords.x, y: coords.y });
+            if (coords) {
+                sendInput({ type: 'mouse_down', button: e.button, x: coords.x, y: coords.y });
+            }
             e.preventDefault();
         });
 
-        video.addEventListener('mouseup', (e) => {
+        videoContainer.addEventListener('mouseup', (e) => {
             const coords = getVideoCoords(e);
-            sendInput({ type: 'mouse_up', button: e.button, x: coords.x, y: coords.y });
+            if (coords) {
+                sendInput({ type: 'mouse_up', button: e.button, x: coords.x, y: coords.y });
+            }
             e.preventDefault();
         });
 
-        video.addEventListener('mousemove', (e) => {
+        videoContainer.addEventListener('mousemove', (e) => {
             const coords = getVideoCoords(e);
-            sendInput({ type: 'mouse_move', x: coords.x, y: coords.y });
-            // Show debug info
-            coordsEl.textContent = `${coords.x},${coords.y} | vid:${video.videoWidth}x${video.videoHeight} | dpr:${window.devicePixelRatio}`;
+            if (coords) {
+                sendInput({ type: 'mouse_move', x: coords.x, y: coords.y });
+                // Show debug info
+                coordsEl.textContent = `${coords.x},${coords.y} | vid:${video.videoWidth}x${video.videoHeight}`;
+            }
         });
 
         video.addEventListener('wheel', (e) => {

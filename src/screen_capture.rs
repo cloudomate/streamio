@@ -1,13 +1,13 @@
-//! Screen capture and WebRTC streaming
+//! Screen capture and WebRTC streaming with audio
 //!
-//! Captures the screen/display and streams via WebRTC - like a VDI.
+//! Captures the screen/display and system audio, streams via WebRTC - like a VDI.
+//! Also receives microphone audio from the browser and plays it locally.
 
 use anyhow::{Context, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_webrtc as gst_webrtc;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// WebRTC signaling messages
@@ -132,10 +132,20 @@ impl ScreenStreamer {
             &rtpcaps,
         ])?;
 
-        // Link to webrtcbin
+        // Link video to webrtcbin
         let rtpcaps_src = rtpcaps.static_pad("src").unwrap();
-        let webrtc_sink = webrtcbin.request_pad_simple("sink_%u").unwrap();
-        rtpcaps_src.link(&webrtc_sink)?;
+        let webrtc_video_sink = webrtcbin.request_pad_simple("sink_%u").unwrap();
+        rtpcaps_src.link(&webrtc_video_sink)?;
+
+        // Add audio pipeline if enabled
+        if std::env::var("ENABLE_AUDIO").unwrap_or_default() == "1" {
+            if let Err(e) = Self::add_audio_pipeline(&pipeline, &webrtcbin) {
+                tracing::warn!("Audio capture not available: {}", e);
+            }
+        }
+
+        // Set up handler for incoming audio from browser (mic)
+        Self::setup_incoming_audio(&pipeline, &webrtcbin);
 
         // Set up WebRTC callbacks
         let tx = outgoing_tx.clone();
@@ -240,6 +250,152 @@ impl ScreenStreamer {
 
         tracing::info!("Using Windows screen capture");
         Ok(src)
+    }
+
+    /// Add audio capture pipeline (system audio → WebRTC)
+    fn add_audio_pipeline(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) -> Result<()> {
+        // Audio source - platform specific
+        #[cfg(target_os = "macos")]
+        let audio_src = {
+            // On macOS, capturing system audio requires a virtual audio device
+            // like BlackHole, Soundflower, or similar. Try to use it if available.
+            gst::ElementFactory::make("osxaudiosrc")
+                .property("do-timestamp", true)
+                .build()
+                .context("osxaudiosrc not available - install BlackHole for system audio")?
+        };
+
+        #[cfg(target_os = "linux")]
+        let audio_src = {
+            gst::ElementFactory::make("pulsesrc")
+                .property("do-timestamp", true)
+                .build()
+                .or_else(|_| gst::ElementFactory::make("alsasrc").build())
+                .context("No audio source available")?
+        };
+
+        #[cfg(target_os = "windows")]
+        let audio_src = {
+            gst::ElementFactory::make("wasapisrc")
+                .property("do-timestamp", true)
+                .build()
+                .context("wasapisrc not available")?
+        };
+
+        // Audio conversion and resampling
+        let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
+        let audioresample = gst::ElementFactory::make("audioresample").build()?;
+
+        // Opus encoder (required for WebRTC)
+        let opusenc = gst::ElementFactory::make("opusenc")
+            .property("bitrate", 64000i32)
+            .property("audio-type", 2051i32)  // Voice
+            .build()
+            .context("opusenc not available")?;
+
+        // RTP payloader
+        let rtpopuspay = gst::ElementFactory::make("rtpopuspay")
+            .property("pt", 111u32)
+            .build()?;
+
+        // RTP caps
+        let audio_rtpcaps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("application/x-rtp")
+                    .field("media", "audio")
+                    .field("encoding-name", "OPUS")
+                    .field("payload", 111i32)
+                    .build(),
+            )
+            .build()?;
+
+        // Add audio elements to pipeline
+        pipeline.add_many([
+            &audio_src,
+            &audioconvert,
+            &audioresample,
+            &opusenc,
+            &rtpopuspay,
+            &audio_rtpcaps,
+        ])?;
+
+        // Link audio elements
+        gst::Element::link_many([
+            &audio_src,
+            &audioconvert,
+            &audioresample,
+            &opusenc,
+            &rtpopuspay,
+            &audio_rtpcaps,
+        ])?;
+
+        // Link to webrtcbin
+        let audio_src_pad = audio_rtpcaps.static_pad("src").unwrap();
+        let webrtc_audio_sink = webrtcbin.request_pad_simple("sink_%u").unwrap();
+        audio_src_pad.link(&webrtc_audio_sink)?;
+
+        tracing::info!("Audio capture pipeline added");
+        Ok(())
+    }
+
+    /// Set up handler for incoming audio from browser (mic → local speakers)
+    fn setup_incoming_audio(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) {
+        let pipeline_weak = pipeline.downgrade();
+
+        webrtcbin.connect_pad_added(move |_webrtc, pad| {
+            let pipeline = match pipeline_weak.upgrade() {
+                Some(p) => p,
+                None => return,
+            };
+
+            // Only handle incoming media (not our outgoing streams)
+            if pad.direction() != gst::PadDirection::Src {
+                return;
+            }
+
+            let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+            let caps = match caps {
+                Some(c) => c,
+                None => return,
+            };
+
+            let s = caps.structure(0).unwrap();
+            let media = s.get::<&str>("media").unwrap_or("");
+
+            if media == "audio" {
+                tracing::info!("Incoming audio stream detected");
+
+                // Create audio playback pipeline
+                let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
+                let dec = gst::ElementFactory::make("opusdec").build().unwrap();
+                let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
+                let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+
+                #[cfg(target_os = "macos")]
+                let sink = gst::ElementFactory::make("osxaudiosink").build().unwrap();
+
+                #[cfg(target_os = "linux")]
+                let sink = gst::ElementFactory::make("pulsesink")
+                    .build()
+                    .unwrap_or_else(|_| gst::ElementFactory::make("alsasink").build().unwrap());
+
+                #[cfg(target_os = "windows")]
+                let sink = gst::ElementFactory::make("wasapisink").build().unwrap();
+
+                pipeline.add_many([&depay, &dec, &convert, &resample, &sink]).unwrap();
+                gst::Element::link_many([&depay, &dec, &convert, &resample, &sink]).unwrap();
+
+                for elem in [&depay, &dec, &convert, &resample, &sink] {
+                    elem.sync_state_with_parent().unwrap();
+                }
+
+                let depay_sink = depay.static_pad("sink").unwrap();
+                pad.link(&depay_sink).unwrap();
+
+                tracing::info!("Browser microphone audio routed to local speakers");
+            }
+        });
     }
 
     fn create_encoder() -> Result<gst::Element> {
