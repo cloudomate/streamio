@@ -26,19 +26,11 @@ jobs:
             echo "No existing release for ${{ github.ref_name }}, proceeding with build."
           fi
 
-  build:
+  build-macos:
     needs: check
     if: needs.check.outputs.exists != 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            name: macos-arm64
-          - os: ubuntu-24.04
-            name: linux-x86_64
-
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
+    environment: dev
 
     steps:
       - uses: actions/checkout@v4
@@ -46,12 +38,103 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install GStreamer (macOS)
-        if: runner.os == 'macOS'
+      - name: Install GStreamer
         run: brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly pkgconf
 
-      - name: Install GStreamer (Linux)
-        if: runner.os == 'Linux'
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Bundle
+        run: chmod +x bundle.sh && ./bundle.sh
+
+      - name: Import certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+      - name: Sign binary and libraries
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: Yashwant Singh ($APPLE_TEAM_ID)"
+          echo "Signing with: $IDENTITY"
+
+          # Sign all dylibs and plugins first (inside out)
+          find dist/lib -type f \( -name "*.dylib" -o -name "*.so" \) | while read f; do
+            codesign --force --options runtime --sign "$IDENTITY" "$f"
+          done
+
+          # Sign plugin scanner
+          if [ -f dist/libexec/gst-plugin-scanner ]; then
+            codesign --force --options runtime --sign "$IDENTITY" dist/libexec/gst-plugin-scanner
+          fi
+
+          # Sign main binary
+          codesign --force --options runtime --sign "$IDENTITY" dist/horizon-streamer
+
+          echo "Verifying signature..."
+          codesign -vvv dist/horizon-streamer
+
+      - name: Create tarball
+        run: tar czf horizon-streamer-macos-arm64.tar.gz -C dist .
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
+            echo "Submitting for notarization..."
+            xcrun notarytool submit horizon-streamer-macos-arm64.tar.gz \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --wait
+            echo "Notarization complete."
+          else
+            echo "Skipping notarization (secrets not configured)."
+          fi
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-streamer-macos-arm64
+          path: horizon-streamer-macos-arm64.tar.gz
+
+  build-linux:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GStreamer
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -70,17 +153,17 @@ jobs:
         run: chmod +x bundle.sh && ./bundle.sh
 
       - name: Create tarball
-        run: tar czf horizon-streamer-${{ matrix.name }}.tar.gz -C dist .
+        run: tar czf horizon-streamer-linux-x86_64.tar.gz -C dist .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: horizon-streamer-${{ matrix.name }}
-          path: horizon-streamer-${{ matrix.name }}.tar.gz
+          name: horizon-streamer-linux-x86_64
+          path: horizon-streamer-linux-x86_64.tar.gz
 
   release:
-    needs: [check, build]
-    if: needs.check.outputs.exists != 'true'
+    needs: [check, build-macos, build-linux]
+    if: always() && needs.check.outputs.exists != 'true' && (needs.build-macos.result == 'success' || needs.build-linux.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
