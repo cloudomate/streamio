@@ -28,7 +28,7 @@ jobs:
 
   build-macos:
     needs: check
-    if: needs.check.outputs.exists != 'true'
+    if: false
     runs-on: macos-latest
     environment: dev
 
