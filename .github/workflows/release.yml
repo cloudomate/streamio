@@ -39,7 +39,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install GStreamer
-        run: brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly libnice pkgconf
+        run: brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly libnice-gstreamer pkgconf
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
