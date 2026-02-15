@@ -273,18 +273,25 @@ elif [[ "$OS" == "Darwin" ]]; then
         for dep in $deps; do
             base=$(basename "$dep")
 
-            # Determine the correct @executable_path-relative path
+            # Determine the correct path rewrite.
+            # Use @loader_path for dylib-to-dylib references so they resolve
+            # correctly regardless of which executable loaded them (main binary
+            # vs gst-plugin-scanner in libexec/).
             if [ -f "$DIST_DIR/lib/$base" ]; then
                 if [[ "$target" == *"/gstreamer-1.0/"* ]]; then
                     new_path="@loader_path/../$base"
                 elif [[ "$target" == *"/libexec/"* ]]; then
                     new_path="@executable_path/../lib/$base"
+                elif [[ "$target" == *.dylib ]]; then
+                    new_path="@loader_path/$base"
                 else
                     new_path="@executable_path/lib/$base"
                 fi
             elif [ -f "$DIST_DIR/lib/gstreamer-1.0/$base" ]; then
                 if [[ "$target" == *"/libexec/"* ]]; then
                     new_path="@executable_path/../lib/gstreamer-1.0/$base"
+                elif [[ "$target" == *.dylib && "$target" != *"/gstreamer-1.0/"* ]]; then
+                    new_path="@loader_path/gstreamer-1.0/$base"
                 else
                     new_path="@executable_path/lib/gstreamer-1.0/$base"
                 fi
@@ -301,7 +308,7 @@ elif [[ "$OS" == "Darwin" ]]; then
             if [[ "$target" == *"/gstreamer-1.0/"* ]]; then
                 install_name_tool -id "@loader_path/../gstreamer-1.0/$base" "$target" 2>/dev/null || true
             else
-                install_name_tool -id "@executable_path/lib/$base" "$target" 2>/dev/null || true
+                install_name_tool -id "@loader_path/$base" "$target" 2>/dev/null || true
             fi
         fi
     done
