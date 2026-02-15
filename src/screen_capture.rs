@@ -218,23 +218,29 @@ impl ScreenStreamer {
 
     #[cfg(target_os = "linux")]
     fn create_linux_capture(_fps: u32) -> Result<gst::Element> {
-        // ximagesrc captures X11 display
-        // For Wayland, use pipewiresrc
-        let src = gst::ElementFactory::make("ximagesrc")
-            .property("use-damage", false)
-            .property("show-pointer", true)
+        // Try X11 capture if DISPLAY is set
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(src) = gst::ElementFactory::make("ximagesrc")
+                .property("use-damage", false)
+                .property("show-pointer", true)
+                .property("do-timestamp", true)
+                .build()
+            {
+                tracing::info!("Using Linux screen capture (ximagesrc)");
+                return Ok(src);
+            }
+        }
+
+        // Wayland / PipeWire fallback
+        if let Ok(src) = gst::ElementFactory::make("pipewiresrc")
             .property("do-timestamp", true)
             .build()
-            .or_else(|_| {
-                // Try pipewire for Wayland
-                gst::ElementFactory::make("pipewiresrc")
-                    .property("do-timestamp", true)
-                    .build()
-            })
-            .context("Failed to create screen capture source")?;
+        {
+            tracing::info!("Using Linux screen capture (pipewiresrc)");
+            return Ok(src);
+        }
 
-        tracing::info!("Using Linux screen capture (ximagesrc/pipewiresrc)");
-        Ok(src)
+        anyhow::bail!("No screen capture source available — set DISPLAY for X11 or ensure PipeWire is running for Wayland")
     }
 
     #[cfg(target_os = "windows")]
