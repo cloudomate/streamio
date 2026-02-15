@@ -444,8 +444,8 @@ impl ScreenStreamer {
 
         // Software fallback (x264)
         let enc = gst::ElementFactory::make("x264enc")
-            .property("tune", 0x00000004u32) // zerolatency
-            .property("speed-preset", 1u32)  // ultrafast
+            .property_from_str("tune", "zerolatency")
+            .property_from_str("speed-preset", "ultrafast")
             .property("key-int-max", 30u32)
             .property("bitrate", 4000u32)    // 4 Mbps
             .build()
