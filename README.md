@@ -1,36 +1,74 @@
 # Horizon Streamer
 
-VDI-style screen capture and WebRTC streaming. Captures your desktop and streams it to browsers with remote keyboard/mouse control and bidirectional audio.
+Stream your desktop to any browser. Low-latency screen capture with remote keyboard and mouse control over WebRTC — a lightweight, self-contained VDI solution.
 
-## Architecture
+## How It Works
+
+Horizon Streamer captures your screen using platform-native APIs, encodes it with hardware-accelerated H.264, and delivers it to browsers via WebRTC. Remote input (mouse, keyboard, scroll) flows back over the same connection, giving you full control of the host machine from any modern browser.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Server                                                       │
-│                                                               │
-│  ┌───────────────┐    ┌─────────────────┐    ┌───────────┐   │
-│  │  Screen/Audio  │    │   GStreamer      │    │  WebRTC   │   │
-│  │  Capture       │───▶│   H.264 + Opus   │───▶│  Server   │──┼──▶ Browser
-│  │                │    │   (HW/SW)        │    │           │   │
-│  └───────────────┘    └─────────────────┘    └───────────┘   │
-│                                                    │          │
-│                     Mouse/Keyboard Input            │          │
-│                     ◀───────────────────────────────┘          │
-└──────────────────────────────────────────────────────────────┘
+ Host Machine                              Browser
+┌─────────────────────────────┐       ┌──────────────────┐
+│  Screen Capture             │       │                  │
+│  (AVFoundation/X11/DirectX) │       │  Video Playback  │
+│         │                   │       │                  │
+│         ▼                   │  H.264│                  │
+│  H.264 Encoder              │──────▶│  Audio Playback  │
+│  (VideoToolbox/NVENC/x264)  │  Opus │                  │
+│         │                   │       │                  │
+│  System Audio ──▶ Opus ─────│──────▶│                  │
+│                             │       │  Mouse/Keyboard  │
+│  Mouse/Keyboard Injection ◀─│◀──────│  Events          │
+│  (Enigo)                    │       │                  │
+└─────────────────────────────┘       └──────────────────┘
+         WebRTC (peer-to-peer, encrypted)
 ```
+
+## Download
+
+Pre-built bundles are available on the [Releases](../../releases) page. No dependencies required — GStreamer and all shared libraries are included.
+
+| Platform | Download |
+|----------|----------|
+| macOS (Apple Silicon) | `horizon-streamer-macos-arm64.tar.gz` |
+| Linux (x86_64) | `horizon-streamer-linux-x86_64.tar.gz` |
+
+```bash
+# Extract and run
+tar xzf horizon-streamer-*.tar.gz
+./horizon-streamer
+```
+
+Then open **http://localhost:8123** in your browser.
 
 ## Features
 
-- **Screen capture**: Platform-native capture (AVFoundation on macOS, X11/PipeWire on Linux, DirectX on Windows)
-- **Hardware encoding**: Automatic fallback chain — VideoToolbox → NVENC → VAAPI → QuickSync → x264
-- **WebRTC streaming**: Low-latency video + audio to browsers
-- **Remote input**: Mouse and keyboard injection from the browser
-- **Bidirectional audio**: System audio to browser + browser microphone to local playback
-- **Self-contained distribution**: `./bundle.sh` packages the binary with all GStreamer libs
+- **Low-latency streaming** — WebRTC with hardware H.264 encoding for sub-100ms latency
+- **Remote desktop control** — Full mouse and keyboard input from the browser
+- **Hardware encoder fallback chain** — VideoToolbox → NVENC → VAAPI → QuickSync → x264
+- **Bidirectional audio** — System audio to browser, browser microphone to host
+- **Platform-native capture** — AVFoundation (macOS), X11/PipeWire (Linux), DirectX (Windows)
+- **Zero-install client** — Just a browser, no plugins or extensions
+- **Self-contained binary** — Single folder with all dependencies bundled
+- **Signed and notarized** — macOS builds are code-signed and Apple-notarized
 
-## Quick Start
+## Configuration
 
-### Prerequisites (for building)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8123` | HTTP server port |
+| `FPS` | `30` | Capture framerate |
+| `DISPLAY_INDEX` | `0` | macOS display index (0 = main) |
+| `ENABLE_AUDIO` | `0` | Set to `1` to enable audio capture |
+| `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+
+```bash
+PORT=9000 FPS=60 ENABLE_AUDIO=1 ./horizon-streamer
+```
+
+## Building from Source
+
+### Prerequisites
 
 **macOS:**
 ```bash
@@ -58,50 +96,18 @@ cargo build --release
 cargo run --release
 ```
 
-Then open http://localhost:8123 in a browser.
-
-### Create Self-Contained Bundle
+### Create a Self-Contained Bundle
 
 ```bash
 ./bundle.sh
 ```
 
-This creates a `dist/` directory with the binary and all GStreamer shared libraries bundled. The `dist/` folder can be copied to any machine of the same OS/architecture — no GStreamer installation required.
+Produces a `dist/` directory with the binary and all GStreamer shared libraries. Copy the entire folder to any machine of the same OS/architecture — no GStreamer installation required.
 
-On **Linux**, `patchelf` is needed for the bundling step: `sudo apt install patchelf`
-
-On **Windows**, copy GStreamer DLLs from `C:\gstreamer\1.0\msvc_x86_64\` next to the `.exe`.
-
-## Configuration
-
-Environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | 8123 | HTTP server port |
-| `FPS` | 30 | Capture framerate |
-| `DISPLAY_INDEX` | 0 | macOS display to capture |
-| `ENABLE_AUDIO` | 0 | Set to `1` for audio capture |
-| `RUST_LOG` | info | Log level (debug, info, warn, error) |
-
-## Docker Deployment
-
-```dockerfile
-FROM nvidia/cuda:12.0-runtime-ubuntu22.04
-
-RUN apt-get update && apt-get install -y \
-    libgstreamer1.0-0 \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-nice
-
-COPY dist/ /app/
-WORKDIR /app
-EXPOSE 8123
-CMD ["./horizon-streamer"]
-```
+On Linux, `patchelf` is needed: `sudo apt install patchelf`
 
 ## License
 
-MIT
+The Horizon Streamer source code is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
+
+The pre-built binary bundles include GStreamer plugins and third-party libraries under their own licenses (LGPL-2.1+, GPL-2.0, BSD). In particular, the inclusion of x264 (GPL-2.0) means the bundled distribution as a whole is subject to the terms of the **GNU General Public License v2.0**. See [COPYING](COPYING) for the full GPL-2.0 text.
