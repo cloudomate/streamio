@@ -92,8 +92,10 @@ jobs:
           echo "Verifying signature..."
           codesign -vvv dist/horizon-streamer
 
-      - name: Create tarball
-        run: tar czf horizon-streamer-macos-arm64.tar.gz -C dist .
+      - name: Create archives
+        run: |
+          ditto -c -k --keepParent dist horizon-streamer-macos-arm64.zip
+          tar czf horizon-streamer-macos-arm64.tar.gz -C dist .
 
       - name: Notarize
         env:
@@ -103,7 +105,7 @@ jobs:
         run: |
           if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
             echo "Submitting for notarization..."
-            xcrun notarytool submit horizon-streamer-macos-arm64.tar.gz \
+            xcrun notarytool submit horizon-streamer-macos-arm64.zip \
               --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" \
               --password "$APPLE_APP_PASSWORD" \
