@@ -70,6 +70,14 @@ async fn main() -> Result<()> {
     // Initialize GStreamer
     gstreamer::init()?;
 
+    // Check that critical plugins are available
+    let registry = gstreamer::Registry::get();
+    for plugin in ["webrtc", "nice", "dtls", "srtp", "rtp", "videoconvertscale"] {
+        if registry.find_plugin(plugin).is_none() {
+            tracing::warn!("GStreamer plugin '{}' not found — WebRTC may not work", plugin);
+        }
+    }
+
     // Read config from environment
     let port: u16 = std::env::var("PORT")
         .ok()

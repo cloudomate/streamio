@@ -133,8 +133,10 @@ impl ScreenStreamer {
         ])?;
 
         // Link video to webrtcbin
-        let rtpcaps_src = rtpcaps.static_pad("src").unwrap();
-        let webrtc_video_sink = webrtcbin.request_pad_simple("sink_%u").unwrap();
+        let rtpcaps_src = rtpcaps.static_pad("src")
+            .context("capsfilter missing src pad")?;
+        let webrtc_video_sink = webrtcbin.request_pad_simple("sink_%u")
+            .context("webrtcbin failed to create sink pad — check that webrtc, srtp, dtls, and nice plugins are loaded")?;
         rtpcaps_src.link(&webrtc_video_sink)?;
 
         // Add audio pipeline if enabled
@@ -331,8 +333,10 @@ impl ScreenStreamer {
         ])?;
 
         // Link to webrtcbin
-        let audio_src_pad = audio_rtpcaps.static_pad("src").unwrap();
-        let webrtc_audio_sink = webrtcbin.request_pad_simple("sink_%u").unwrap();
+        let audio_src_pad = audio_rtpcaps.static_pad("src")
+            .context("audio capsfilter missing src pad")?;
+        let webrtc_audio_sink = webrtcbin.request_pad_simple("sink_%u")
+            .context("webrtcbin failed to create audio sink pad")?;
         audio_src_pad.link(&webrtc_audio_sink)?;
 
         tracing::info!("Audio capture pipeline added");
