@@ -329,8 +329,11 @@ elif [[ "$OS" == "Linux" ]]; then
     else
         patchelf --set-rpath '$ORIGIN/lib' "$DIST_DIR/$BINARY_NAME"
         [ -f "$DIST_DIR/libexec/gst-plugin-scanner" ] && patchelf --set-rpath '$ORIGIN/../lib' "$DIST_DIR/libexec/gst-plugin-scanner"
-        for f in "$DIST_DIR/lib/"*.so* "$DIST_DIR/lib/gstreamer-1.0/"*.so*; do
+        for f in "$DIST_DIR/lib/"*.so*; do
             [ -f "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+        done
+        for f in "$DIST_DIR/lib/gstreamer-1.0/"*.so*; do
+            [ -f "$f" ] && patchelf --set-rpath '$ORIGIN/..' "$f" 2>/dev/null || true
         done
     fi
 fi
