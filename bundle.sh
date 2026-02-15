@@ -220,9 +220,10 @@ for round in $(seq 1 $MAX_ROUNDS); do
             if [[ "$base" == "${BINARY_NAME}"* ]]; then
                 continue
             fi
-            # Copy the dep
-            if [ -f "$dep" ]; then
-                cp "$dep" "$DIST_DIR/lib/"
+            # Copy the dep (resolve symlinks to get the real file)
+            real_dep=$(realpath "$dep" 2>/dev/null || readlink -f "$dep" 2>/dev/null || echo "$dep")
+            if [ -f "$real_dep" ]; then
+                cp "$real_dep" "$DIST_DIR/lib/$base"
                 COPIED_LIBS+=("$base")
                 NEW_DEPS+=("$DIST_DIR/lib/$base")
                 echo "  + $base"
@@ -277,12 +278,16 @@ elif [[ "$OS" == "Darwin" ]]; then
                 if [[ "$target" == *"/gstreamer-1.0/"* ]]; then
                     new_path="@loader_path/../$base"
                 elif [[ "$target" == *"/libexec/"* ]]; then
-                    new_path="@executable_path/lib/$base"
+                    new_path="@executable_path/../lib/$base"
                 else
                     new_path="@executable_path/lib/$base"
                 fi
             elif [ -f "$DIST_DIR/lib/gstreamer-1.0/$base" ]; then
-                new_path="@executable_path/lib/gstreamer-1.0/$base"
+                if [[ "$target" == *"/libexec/"* ]]; then
+                    new_path="@executable_path/../lib/gstreamer-1.0/$base"
+                else
+                    new_path="@executable_path/lib/gstreamer-1.0/$base"
+                fi
             else
                 continue
             fi
