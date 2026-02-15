@@ -186,7 +186,7 @@ for round in $(seq 1 $MAX_ROUNDS); do
 
     for bin in "${ALL_BINS[@]}"; do
         if [[ "$OS" == "Darwin" ]]; then
-            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "@")
+            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "^@")
         elif [[ "$OS" == "Windows" ]]; then
             # Use objdump to list DLL imports, then resolve from GStreamer bin dir
             deps=""
