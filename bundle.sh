@@ -1,13 +1,25 @@
 #!/bin/bash
 # Bundle horizon-streamer with all GStreamer dependencies for self-contained distribution.
-# Supports macOS (Homebrew) and Linux (apt/system GStreamer).
+# Supports macOS (Homebrew), Linux (apt/system GStreamer), and Windows (MSYS2/Git Bash).
 # The resulting dist/ directory can be copied to any machine of the same OS/arch.
 
 set -e
 
 BINARY_NAME="horizon-streamer"
 DIST_DIR="dist"
-BINARY="target/release/$BINARY_NAME"
+
+OS="$(uname -s)"
+case "$OS" in
+    MINGW*|MSYS*|CYGWIN*) OS="Windows" ;;
+    Darwin)               OS="Darwin" ;;
+    *)                    OS="Linux" ;;
+esac
+
+if [[ "$OS" == "Windows" ]]; then
+    BINARY="target/release/${BINARY_NAME}.exe"
+else
+    BINARY="target/release/$BINARY_NAME"
+fi
 
 # GStreamer plugins required by screen_capture.rs pipelines
 REQUIRED_PLUGINS=(
@@ -35,9 +47,11 @@ REQUIRED_PLUGINS=(
 )
 
 # Platform-specific plugins
-if [[ "$(uname)" == "Darwin" ]]; then
+if [[ "$OS" == "Darwin" ]]; then
     REQUIRED_PLUGINS+=(libgstapplemedia libgstosxaudio)
-elif [[ "$(uname)" == "Linux" ]]; then
+elif [[ "$OS" == "Windows" ]]; then
+    REQUIRED_PLUGINS+=(gstd3d11 gstwasapi2 gstd3d12 gstnvcodec gstqsv gstmediafoundation)
+elif [[ "$OS" == "Linux" ]]; then
     REQUIRED_PLUGINS+=(libgstpulseaudio libgstximagesrc libgstpipewire libgstv4l2 libgstvideo4linux2 libgstnvcodec libgstvaapi)
 fi
 
@@ -52,14 +66,20 @@ fi
 echo ""
 echo "=== Creating distribution bundle ==="
 rm -rf "$DIST_DIR"
-mkdir -p "$DIST_DIR/lib/gstreamer-1.0"
-mkdir -p "$DIST_DIR/libexec"
+
+if [[ "$OS" == "Windows" ]]; then
+    # Windows: flat layout — DLLs and plugins all next to the exe
+    mkdir -p "$DIST_DIR/lib/gstreamer-1.0"
+else
+    mkdir -p "$DIST_DIR/lib/gstreamer-1.0"
+    mkdir -p "$DIST_DIR/libexec"
+fi
 
 cp "$BINARY" "$DIST_DIR/"
 
 # --- Discover GStreamer paths ---
 
-if [[ "$(uname)" == "Darwin" ]]; then
+if [[ "$OS" == "Darwin" ]]; then
     # macOS: find GStreamer via otool on the binary
     GST_LIB_DIR=$(otool -L "$BINARY" | grep libgstreamer | awk '{print $1}' | xargs dirname)
     if [ -z "$GST_LIB_DIR" ]; then
@@ -76,6 +96,27 @@ if [[ "$(uname)" == "Darwin" ]]; then
     if [ -z "$GST_SCANNER" ]; then
         GST_SCANNER=$(find "$(dirname "$GST_LIB_DIR")" -name gst-plugin-scanner -type f 2>/dev/null | head -1)
     fi
+
+elif [[ "$OS" == "Windows" ]]; then
+    # Windows: find GStreamer from GSTREAMER_1_0_ROOT or standard install paths
+    if [ -n "$GSTREAMER_1_0_ROOT_MSVC_X86_64" ]; then
+        GST_ROOT="$GSTREAMER_1_0_ROOT_MSVC_X86_64"
+    elif [ -n "$GSTREAMER_1_0_ROOT_X86_64" ]; then
+        GST_ROOT="$GSTREAMER_1_0_ROOT_X86_64"
+    elif [ -d "/c/gstreamer/1.0/msvc_x86_64" ]; then
+        GST_ROOT="/c/gstreamer/1.0/msvc_x86_64"
+    elif [ -d "/c/gstreamer/1.0/x86_64" ]; then
+        GST_ROOT="/c/gstreamer/1.0/x86_64"
+    else
+        echo "ERROR: Cannot find GStreamer installation. Set GSTREAMER_1_0_ROOT_MSVC_X86_64 or install to C:\\gstreamer"
+        exit 1
+    fi
+    GST_LIB_DIR="$GST_ROOT/lib"
+    GST_BIN_DIR="$GST_ROOT/bin"
+    GST_PLUGIN_DIR="$GST_LIB_DIR/gstreamer-1.0"
+    GST_SCANNER="$GST_ROOT/libexec/gstreamer-1.0/gst-plugin-scanner.exe"
+    [ ! -f "$GST_SCANNER" ] && GST_SCANNER=""
+
 else
     # Linux: check standard paths
     for dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib; do
@@ -100,7 +141,11 @@ echo "Plugin scanner:    ${GST_SCANNER:-not found}"
 # --- Copy plugin scanner ---
 
 if [ -n "$GST_SCANNER" ]; then
-    cp "$GST_SCANNER" "$DIST_DIR/libexec/"
+    if [[ "$OS" == "Windows" ]]; then
+        cp "$GST_SCANNER" "$DIST_DIR/"
+    else
+        cp "$GST_SCANNER" "$DIST_DIR/libexec/"
+    fi
     echo "Copied gst-plugin-scanner"
 fi
 
@@ -126,11 +171,12 @@ echo ""
 echo "Resolving shared library dependencies..."
 
 # Collect all binaries we need to trace
-ALL_BINS=("$DIST_DIR/$BINARY_NAME")
+ALL_BINS=("$DIST_DIR/$(basename "$BINARY")")
 for f in "$DIST_DIR/lib/gstreamer-1.0/"*; do
     [ -f "$f" ] && ALL_BINS+=("$f")
 done
 [ -f "$DIST_DIR/libexec/gst-plugin-scanner" ] && ALL_BINS+=("$DIST_DIR/libexec/gst-plugin-scanner")
+[ -f "$DIST_DIR/gst-plugin-scanner.exe" ] && ALL_BINS+=("$DIST_DIR/gst-plugin-scanner.exe")
 
 # Iteratively resolve deps until no new ones are found
 COPIED_LIBS=()
@@ -139,8 +185,27 @@ for round in $(seq 1 $MAX_ROUNDS); do
     NEW_DEPS=()
 
     for bin in "${ALL_BINS[@]}"; do
-        if [[ "$(uname)" == "Darwin" ]]; then
+        if [[ "$OS" == "Darwin" ]]; then
             deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -v "^/usr/lib" | grep -v "^/System" | grep -v "@")
+        elif [[ "$OS" == "Windows" ]]; then
+            # Use objdump to list DLL imports, then resolve from GStreamer bin dir
+            deps=""
+            for dll in $(objdump -p "$bin" 2>/dev/null | grep "DLL Name:" | awk '{print $3}'); do
+                # Skip Windows system DLLs
+                case "$dll" in
+                    KERNEL32.dll|USER32.dll|GDI32.dll|ADVAPI32.dll|SHELL32.dll|ole32.dll|OLEAUT32.dll|\
+                    WS2_32.dll|WSOCK32.dll|CRYPT32.dll|WLDAP32.dll|ntdll.dll|msvcrt.dll|VCRUNTIME*.dll|\
+                    ucrtbase.dll|api-ms-*|ext-ms-*|bcrypt.dll|MSWSOCK.dll|secur32.dll|IPHLPAPI.DLL|\
+                    USERENV.dll|dbghelp.dll|IMM32.dll|SETUPAPI.dll|CFGMGR32.dll|dwmapi.dll|d3d11.dll|\
+                    d3d12.dll|dxgi.dll|d3dcompiler_*.dll|DNSAPI.dll|VERSION.dll|WINMM.dll|COMCTL32.dll|\
+                    COMDLG32.dll|WTSAPI32.dll|PSAPI.DLL|RPCRT4.dll|Normaliz.dll|Secur32.dll)
+                        continue ;;
+                esac
+                # Look for DLL in GStreamer bin dir
+                if [ -f "$GST_BIN_DIR/$dll" ]; then
+                    deps="$deps $GST_BIN_DIR/$dll"
+                fi
+            done
         else
             deps=$(ldd "$bin" 2>/dev/null | grep "=>" | awk '{print $3}' | grep -v "^/lib" | grep -v "^$")
         fi
@@ -152,7 +217,7 @@ for round in $(seq 1 $MAX_ROUNDS); do
                 continue
             fi
             # Skip if it's the binary itself
-            if [ "$base" = "$BINARY_NAME" ]; then
+            if [[ "$base" == "${BINARY_NAME}"* ]]; then
                 continue
             fi
             # Copy the dep
@@ -178,7 +243,19 @@ echo "Copied ${#COPIED_LIBS[@]} shared libraries"
 # --- Fix library paths ---
 
 echo ""
-if [[ "$(uname)" == "Darwin" ]]; then
+if [[ "$OS" == "Windows" ]]; then
+    echo "Windows: moving DLLs next to executable..."
+    # Windows finds DLLs in the exe directory — flatten lib/ into dist/
+    for f in "$DIST_DIR/lib/"*.dll; do
+        [ -f "$f" ] && mv "$f" "$DIST_DIR/"
+    done
+    for f in "$DIST_DIR/lib/gstreamer-1.0/"*.dll; do
+        [ -f "$f" ] && mv "$f" "$DIST_DIR/lib/gstreamer-1.0/"
+    done
+    # Remove empty lib dir (keep lib/gstreamer-1.0/ — setup_bundled_gstreamer() expects it)
+    rmdir "$DIST_DIR/libexec" 2>/dev/null || true
+
+elif [[ "$OS" == "Darwin" ]]; then
     echo "Rewriting dylib paths for macOS..."
 
     # Collect all dylibs and binaries to fix
@@ -230,7 +307,7 @@ if [[ "$(uname)" == "Darwin" ]]; then
         codesign --force --sign - "$f" 2>/dev/null || true
     done
 
-elif [[ "$(uname)" == "Linux" ]]; then
+elif [[ "$OS" == "Linux" ]]; then
     echo "Setting rpath for Linux..."
 
     if ! command -v patchelf &>/dev/null; then
@@ -253,10 +330,21 @@ TOTAL_SIZE=$(du -sh "$DIST_DIR" | awk '{print $1}')
 echo "Location: $DIST_DIR/"
 echo "Size:     $TOTAL_SIZE"
 echo ""
-echo "Contents:"
-echo "  $DIST_DIR/$BINARY_NAME"
-echo "  $DIST_DIR/lib/              ($(ls "$DIST_DIR/lib/" | wc -l | tr -d ' ') shared libraries)"
-echo "  $DIST_DIR/lib/gstreamer-1.0/ ($PLUGIN_COUNT plugins)"
-echo "  $DIST_DIR/libexec/          (plugin scanner)"
-echo ""
-echo "To run: ./$DIST_DIR/$BINARY_NAME"
+if [[ "$OS" == "Windows" ]]; then
+    EXE_NAME="${BINARY_NAME}.exe"
+    DLL_COUNT=$(ls "$DIST_DIR/"*.dll 2>/dev/null | wc -l | tr -d ' ')
+    echo "Contents:"
+    echo "  $DIST_DIR/$EXE_NAME"
+    echo "  $DIST_DIR/*.dll             ($DLL_COUNT shared libraries)"
+    echo "  $DIST_DIR/lib/gstreamer-1.0/ ($PLUGIN_COUNT plugins)"
+    echo ""
+    echo "To run: $DIST_DIR\\$EXE_NAME"
+else
+    echo "Contents:"
+    echo "  $DIST_DIR/$BINARY_NAME"
+    echo "  $DIST_DIR/lib/              ($(ls "$DIST_DIR/lib/" | wc -l | tr -d ' ') shared libraries)"
+    echo "  $DIST_DIR/lib/gstreamer-1.0/ ($PLUGIN_COUNT plugins)"
+    echo "  $DIST_DIR/libexec/          (plugin scanner)"
+    echo ""
+    echo "To run: ./$DIST_DIR/$BINARY_NAME"
+fi

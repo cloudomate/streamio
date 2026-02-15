@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+          - os: macos-13
+            name: macos-x86_64
+          - os: ubuntu-22.04
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GStreamer (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly pkgconf
+
+      - name: Install GStreamer (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-nice libnice-dev \
+            libx11-dev libxtst-dev libxdo-dev \
+            patchelf
+
+      - name: Install GStreamer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Download GStreamer MSVC runtime + development installers
+          $GST_VERSION = "1.24.12"
+          $BASE_URL = "https://gstreamer.freedesktop.org/data/pkg/windows/$GST_VERSION"
+          $RUNTIME_MSI = "gstreamer-1.0-msvc-x86_64-$GST_VERSION.msi"
+          $DEVEL_MSI = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
+
+          Write-Host "Downloading GStreamer $GST_VERSION..."
+          Invoke-WebRequest -Uri "$BASE_URL/$RUNTIME_MSI" -OutFile "$RUNTIME_MSI"
+          Invoke-WebRequest -Uri "$BASE_URL/$DEVEL_MSI" -OutFile "$DEVEL_MSI"
+
+          Write-Host "Installing GStreamer runtime..."
+          Start-Process msiexec.exe -ArgumentList "/i", "$RUNTIME_MSI", "/quiet", "/norestart", "INSTALLDIR=C:\gstreamer" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer development..."
+          Start-Process msiexec.exe -ArgumentList "/i", "$DEVEL_MSI", "/quiet", "/norestart", "INSTALLDIR=C:\gstreamer" -Wait -NoNewWindow
+
+          # Set env vars for cargo build and bundle.sh
+          $GST_ROOT = "C:\gstreamer\1.0\msvc_x86_64"
+          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$GST_ROOT" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$GST_ROOT\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "$GST_ROOT\bin" >> $env:GITHUB_PATH
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Bundle (Unix)
+        if: runner.os != 'Windows'
+        run: chmod +x bundle.sh && ./bundle.sh
+
+      - name: Bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./bundle.sh
+
+      - name: Create tarball (Unix)
+        if: runner.os != 'Windows'
+        run: tar czf horizon-streamer-${{ matrix.name }}.tar.gz -C dist .
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\* -DestinationPath horizon-streamer-${{ matrix.name }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-streamer-${{ matrix.name }}
+          path: |
+            horizon-streamer-${{ matrix.name }}.tar.gz
+            horizon-streamer-${{ matrix.name }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            horizon-streamer-*.tar.gz
+            horizon-streamer-*.zip
