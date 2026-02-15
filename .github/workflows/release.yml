@@ -87,15 +87,15 @@ jobs:
           fi
 
           # Sign main binary
-          codesign --force --options runtime --sign "$IDENTITY" dist/horizon-streamer
+          codesign --force --options runtime --sign "$IDENTITY" dist/streamio
 
           echo "Verifying signature..."
-          codesign -vvv dist/horizon-streamer
+          codesign -vvv dist/streamio
 
       - name: Create archives
         run: |
-          ditto -c -k --keepParent dist horizon-streamer-macos-arm64.zip
-          tar czf horizon-streamer-macos-arm64.tar.gz -C dist .
+          ditto -c -k --keepParent dist streamio-macos-arm64.zip
+          tar czf streamio-macos-arm64.tar.gz -C dist .
 
       - name: Notarize
         env:
@@ -105,7 +105,7 @@ jobs:
         run: |
           if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_PASSWORD" ]; then
             echo "Submitting for notarization..."
-            xcrun notarytool submit horizon-streamer-macos-arm64.zip \
+            xcrun notarytool submit streamio-macos-arm64.zip \
               --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" \
               --password "$APPLE_APP_PASSWORD" \
@@ -122,8 +122,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: horizon-streamer-macos-arm64
-          path: horizon-streamer-macos-arm64.tar.gz
+          name: streamio-macos-arm64
+          path: streamio-macos-arm64.tar.gz
 
   build-linux:
     needs: check
@@ -155,13 +155,13 @@ jobs:
         run: chmod +x bundle.sh && ./bundle.sh
 
       - name: Create tarball
-        run: tar czf horizon-streamer-linux-x86_64.tar.gz -C dist .
+        run: tar czf streamio-linux-x86_64.tar.gz -C dist .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: horizon-streamer-linux-x86_64
-          path: horizon-streamer-linux-x86_64.tar.gz
+          name: streamio-linux-x86_64
+          path: streamio-linux-x86_64.tar.gz
 
   release:
     needs: [check, build-macos, build-linux]
@@ -177,4 +177,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: horizon-streamer-*.tar.gz
+          files: streamio-*.tar.gz

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Horizon Streamer — a Rust-based VDI/remote desktop streaming application. Captures screens and streams them to browsers via WebRTC using GStreamer. Supports bidirectional audio and remote mouse/keyboard input injection. Designed to ship as a self-contained bundle with GStreamer libs included.
+Streamio — a Rust-based VDI/remote desktop streaming application. Captures screens and streams them to browsers via WebRTC using GStreamer. Supports bidirectional audio and remote mouse/keyboard input injection. Designed to ship as a self-contained bundle with GStreamer libs included.
 
 ## Build Commands
 

@@ -1,10 +1,10 @@
-# Horizon Streamer
+# Streamio
 
 Stream your desktop to any browser. Low-latency screen capture with remote keyboard and mouse control over WebRTC — a lightweight, self-contained VDI solution.
 
 ## How It Works
 
-Horizon Streamer captures your screen using platform-native APIs, encodes it with hardware-accelerated H.264, and delivers it to browsers via WebRTC. Remote input (mouse, keyboard, scroll) flows back over the same connection, giving you full control of the host machine from any modern browser.
+Streamio captures your screen using platform-native APIs, encodes it with hardware-accelerated H.264, and delivers it to browsers via WebRTC. Remote input (mouse, keyboard, scroll) flows back over the same connection, giving you full control of the host machine from any modern browser.
 
 ```
  Host Machine                              Browser
@@ -30,13 +30,13 @@ Pre-built bundles are available on the [Releases](../../releases) page. No depen
 
 | Platform | Download |
 |----------|----------|
-| macOS (Apple Silicon) | `horizon-streamer-macos-arm64.tar.gz` |
-| Linux (x86_64) | `horizon-streamer-linux-x86_64.tar.gz` |
+| macOS (Apple Silicon) | `streamio-macos-arm64.tar.gz` |
+| Linux (x86_64) | `streamio-linux-x86_64.tar.gz` |
 
 ```bash
 # Extract and run
-tar xzf horizon-streamer-*.tar.gz
-./horizon-streamer
+tar xzf streamio-*.tar.gz
+./streamio
 ```
 
 Then open **http://localhost:8123** in your browser.
@@ -63,7 +63,7 @@ Then open **http://localhost:8123** in your browser.
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 
 ```bash
-PORT=9000 FPS=60 ENABLE_AUDIO=1 ./horizon-streamer
+PORT=9000 FPS=60 ENABLE_AUDIO=1 ./streamio
 ```
 
 ## Building from Source
@@ -108,6 +108,6 @@ On Linux, `patchelf` is needed: `sudo apt install patchelf`
 
 ## License
 
-The Horizon Streamer source code is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
+The Streamio source code is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
 
 The pre-built binary bundles include GStreamer plugins and third-party libraries under their own licenses (LGPL-2.1+, GPL-2.0, BSD). In particular, the inclusion of x264 (GPL-2.0) means the bundled distribution as a whole is subject to the terms of the **GNU General Public License v2.0**. See [COPYING](COPYING) for the full GPL-2.0 text.

@@ -1,4 +1,4 @@
-//! Screen Streamer - VDI-style screen capture and WebRTC streaming
+//! Streamio - VDI-style screen capture and WebRTC streaming
 //!
 //! Captures the screen/display and streams via WebRTC to browsers.
 
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_FPS);
 
-    tracing::info!("Screen Streamer v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Streamio v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Capturing screen at {} fps", fps);
     tracing::info!("Open http://localhost:{} to view", port);
 

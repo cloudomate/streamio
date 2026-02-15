@@ -1,11 +1,11 @@
 #!/bin/bash
-# Bundle horizon-streamer with all GStreamer dependencies for self-contained distribution.
+# Bundle streamio with all GStreamer dependencies for self-contained distribution.
 # Supports macOS (Homebrew), Linux (apt/system GStreamer), and Windows (MSYS2/Git Bash).
 # The resulting dist/ directory can be copied to any machine of the same OS/arch.
 
 set -e
 
-BINARY_NAME="horizon-streamer"
+BINARY_NAME="streamio"
 DIST_DIR="dist"
 
 OS="$(uname -s)"
