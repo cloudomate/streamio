@@ -8,7 +8,27 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Check if release exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" &>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ github.ref_name }} already exists, skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No existing release for ${{ github.ref_name }}, proceeding with build."
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +79,8 @@ jobs:
           path: horizon-streamer-${{ matrix.name }}.tar.gz
 
   release:
-    needs: build
+    needs: [check, build]
+    if: needs.check.outputs.exists != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
