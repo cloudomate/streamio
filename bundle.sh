@@ -207,7 +207,8 @@ for round in $(seq 1 $MAX_ROUNDS); do
                 fi
             done
         else
-            deps=$(ldd "$bin" 2>/dev/null | grep "=>" | awk '{print $3}' | grep -v "^/lib" | grep -v "^$" || true)
+            deps=$(ldd "$bin" 2>/dev/null | grep "=>" | awk '{print $3}' | grep -v "^$" \
+                | grep -Ev '/(libc|libm|libdl|librt|libpthread|libutil|libresolv|libnsl|libcrypt|ld-linux|libgcc_s|libstdc\+\+|linux-vdso)\.so' || true)
         fi
 
         for dep in $deps; do
