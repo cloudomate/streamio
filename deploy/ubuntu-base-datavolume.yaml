@@ -1,0 +1,30 @@
+# Example base image DataVolume for Ubuntu 22.04 LTS.
+# CDI imports the cloud image into a PVC that KubeVirt VMs can clone from.
+#
+# Prerequisites:
+#   - CDI (Containerized Data Importer) installed in the cluster
+#   - Sufficient storage in the 'vdi' namespace
+#
+# Apply with: kubectl apply -f deploy/ubuntu-base-datavolume.yaml
+# Watch:      kubectl get datavolume -n vdi -w
+---
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-22.04-base
+  namespace: vdi
+  labels:
+    streamio/role: base-image
+spec:
+  source:
+    http:
+      # Ubuntu 22.04 LTS minimal cloud image (qcow2)
+      url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        # Base image size — user disks will be cloned and can grow independently
+        storage: 20Gi
+    storageClassName: standard  # adjust to your cluster's StorageClass

@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: streamio
+      POSTGRES_PASSWORD: streamio
+      POSTGRES_DB: streamio
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "streamio"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://streamio:streamio@postgres/streamio
+      REDIS_URL: redis://redis/
+      JWT_SECRET: "${JWT_SECRET:-change-me-in-production}"
+      OIDC_ISSUER_URL: "${OIDC_ISSUER_URL}"
+      OIDC_CLIENT_ID: "${OIDC_CLIENT_ID}"
+      OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET}"
+      OIDC_REDIRECT_URI: "${OIDC_REDIRECT_URI:-http://localhost:8080/auth/callback}"
+      GATEWAY_PORT: "8080"
+      GATEWAY_ORIGIN: "${GATEWAY_ORIGIN:-http://localhost:8080}"
+      ADMIN_SUBS: "${ADMIN_SUBS:-}"
+      RUST_LOG: "streamio_gateway=info,tower_http=debug"
+
+  # Example backend instance — add more for multi-user setups
+  backend-1:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PORT: "9001"
+      FPS: "30"
+      BACKEND_TOKEN_SECRET: "${JWT_SECRET:-change-me-in-production}"
+      GATEWAY_ORIGIN: "http://gateway:8080"
+      GATEWAY_URL: "http://gateway:8080"
+      BACKEND_ID: "00000000-0000-0000-0000-000000000001"
+      RUST_LOG: "streamio=info"
+    # Note: screen capture requires host display access on Linux.
+    # Uncomment and adjust for your environment:
+    # environment:
+    #   DISPLAY: ":0"
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # volumes:
+    #   - /tmp/.X11-unix:/tmp/.X11-unix
+
+volumes:
+  postgres_data:
