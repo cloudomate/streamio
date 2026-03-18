@@ -3,11 +3,21 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    curl wget pkg-config ca-certificates \
-    gcc g++ \
-    gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+    curl wget pkg-config ca-certificates xz-utils \
     msitools \
     && rm -rf /var/lib/apt/lists/*
+
+# Use llvm-mingw (LLVM/Clang-based MinGW toolchain).
+# Unlike GCC-MinGW, LLVM generates proper 64-bit GOT-based access for all
+# imported symbols so it never produces 32-bit pseudo-relocations that fail
+# when Windows ASLR places DLLs >2 GB from the executable.
+ARG LLVM_MINGW_TAG=20250114
+RUN wget -q "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/llvm-mingw-${LLVM_MINGW_TAG}-msvcrt-ubuntu-20.04-x86_64.tar.xz" \
+        -O /tmp/llvm-mingw.tar.xz && \
+    tar -xf /tmp/llvm-mingw.tar.xz -C /opt && \
+    rm /tmp/llvm-mingw.tar.xz && \
+    mv /opt/llvm-mingw-${LLVM_MINGW_TAG}-msvcrt-ubuntu-20.04-x86_64 /opt/llvm-mingw
+ENV PATH="/opt/llvm-mingw/bin:${PATH}"
 
 # Install Rust with Windows x86_64 target
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -15,14 +25,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup target add x86_64-pc-windows-gnu
 
-# Download and extract GStreamer MinGW x86_64 dev package
-# gstreamer-rs 0.23 requires GStreamer >= 1.24; use latest stable 1.26.x
+# Download and extract GStreamer MinGW x86_64 packages
+# - devel: headers + import libs (needed for linking)
+# - runtime: actual DLLs + plugin DLLs (needed for bundling)
 ARG GST_VERSION=1.26.11
-RUN wget -q "https://gstreamer.freedesktop.org/data/pkg/windows/${GST_VERSION}/mingw/gstreamer-1.0-devel-mingw-x86_64-${GST_VERSION}.msi" \
+RUN mkdir -p /gst && \
+    wget -q "https://gstreamer.freedesktop.org/data/pkg/windows/${GST_VERSION}/mingw/gstreamer-1.0-devel-mingw-x86_64-${GST_VERSION}.msi" \
         -O /tmp/gst-devel.msi && \
-    mkdir -p /gst && \
     msiextract /tmp/gst-devel.msi -C /gst && \
-    rm /tmp/gst-devel.msi
+    rm /tmp/gst-devel.msi && \
+    wget -q "https://gstreamer.freedesktop.org/data/pkg/windows/${GST_VERSION}/mingw/gstreamer-1.0-mingw-x86_64-${GST_VERSION}.msi" \
+        -O /tmp/gst-runtime.msi && \
+    msiextract /tmp/gst-runtime.msi -C /gst && \
+    rm /tmp/gst-runtime.msi
 
 # Find extraction root and fix Windows-style prefix= paths in .pc files
 RUN GST_ROOT=$(find /gst -name "gstreamer-1.0.pc" | head -1 | xargs dirname | sed 's|/lib/pkgconfig||') && \
@@ -32,14 +47,11 @@ RUN GST_ROOT=$(find /gst -name "gstreamer-1.0.pc" | head -1 | xargs dirname | se
     echo "PKG_CONFIG_PATH=${GST_ROOT}/lib/pkgconfig" >> /etc/gst-env.sh && \
     echo "PKG_CONFIG_ALLOW_CROSS=1" >> /etc/gst-env.sh
 
-# Cargo linker config for x86_64-pc-windows-gnu
-# posix variant avoids CRT symbol issues.
-# target-cpu=x86-64-v2 enables SSE4.1 so LLVM emits ROUNDSD instead of
-# calling C round(), avoiding the undefined-symbol link error on MinGW.
-# x86-64-v2 = SSE4.2 + POPCNT, supported on all x64 hardware since ~2009.
+# Cargo linker config: use llvm-mingw's clang as linker driver.
+# target-cpu=x86-64-v2 enables SSE4.1/ROUNDSD (avoids undefined round() symbol).
 RUN mkdir -p /root/.cargo && printf \
 '[target.x86_64-pc-windows-gnu]\n\
-linker = "x86_64-w64-mingw32-gcc-posix"\n\
+linker = "x86_64-w64-mingw32-clang"\n\
 rustflags = ["-C", "target-cpu=x86-64-v2"]\n' \
 > /root/.cargo/config.toml
 

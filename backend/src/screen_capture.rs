@@ -410,8 +410,8 @@ impl ScreenStreamer {
         #[cfg(target_os = "windows")]
         if let Ok(enc) = gst::ElementFactory::make("mfh264enc")
             .property("low-latency", true)
-            .property("gop-size", 60i32)
-            .property("bitrate", 4000u32)  // 4 Mbps
+            .property("gop-size", 15i32)   // keyframe every 0.5s for fast recovery
+            .property("bitrate", 6000u32)  // 6 Mbps
             .build()
         {
             tracing::info!("Using Windows Media Foundation H.264 encoder (hardware)");

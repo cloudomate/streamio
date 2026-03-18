@@ -299,7 +299,7 @@
 
         // Get coordinates relative to actual video content
         // Handles letterboxing and aspect ratio differences
-        // GStreamer avfvideosrc captures at point resolution, so no DPR adjustment needed
+        // Clamps to screen edges instead of returning null
         function getVideoCoords(e) {
             const rect = video.getBoundingClientRect();
             const videoWidth = video.videoWidth || 1920;
@@ -311,58 +311,48 @@
 
             let displayWidth, displayHeight, offsetX, offsetY;
             if (rectAspect > videoAspect) {
-                // Letterboxed horizontally (black bars on sides)
                 displayHeight = rect.height;
                 displayWidth = rect.height * videoAspect;
                 offsetX = (rect.width - displayWidth) / 2;
                 offsetY = 0;
             } else {
-                // Letterboxed vertically (black bars on top/bottom)
                 displayWidth = rect.width;
                 displayHeight = rect.width / videoAspect;
                 offsetX = 0;
                 offsetY = (rect.height - displayHeight) / 2;
             }
 
-            // Calculate position within the actual video content
-            const relX = e.clientX - rect.left - offsetX;
-            const relY = e.clientY - rect.top - offsetY;
+            // Calculate position within video content, clamped to edges
+            const relX = Math.max(0, Math.min(displayWidth, e.clientX - rect.left - offsetX));
+            const relY = Math.max(0, Math.min(displayHeight, e.clientY - rect.top - offsetY));
 
-            // Check if click is within video content area
-            if (relX < 0 || relX > displayWidth || relY < 0 || relY > displayHeight) {
-                return null;  // Click outside video content
-            }
-
-            // Scale to video resolution (which is in screen points on macOS)
             const scaleX = videoWidth / displayWidth;
             const scaleY = videoHeight / displayHeight;
 
             return {
-                x: Math.round(relX * scaleX),
-                y: Math.round(relY * scaleY)
+                x: Math.min(videoWidth - 1, Math.round(relX * scaleX)),
+                y: Math.min(videoHeight - 1, Math.round(relY * scaleY))
             };
         }
 
-        // Mouse events - use video container for better event capture
+        // Mouse events - use pointer events + capture for reliable tracking
         const videoContainer = document.getElementById('videoContainer');
 
-        videoContainer.addEventListener('mousedown', (e) => {
+        videoContainer.addEventListener('pointerdown', (e) => {
+            videoContainer.setPointerCapture(e.pointerId);
             const coords = getVideoCoords(e);
-            if (coords) {
-                sendInput({ type: 'mouse_down', button: e.button, x: coords.x, y: coords.y });
-            }
+            sendInput({ type: 'mouse_down', button: e.button, x: coords.x, y: coords.y });
             e.preventDefault();
         });
 
-        videoContainer.addEventListener('mouseup', (e) => {
+        videoContainer.addEventListener('pointerup', (e) => {
             const coords = getVideoCoords(e);
-            if (coords) {
-                sendInput({ type: 'mouse_up', button: e.button, x: coords.x, y: coords.y });
-            }
+            sendInput({ type: 'mouse_up', button: e.button, x: coords.x, y: coords.y });
+            videoContainer.releasePointerCapture(e.pointerId);
             e.preventDefault();
         });
 
-        // Throttle mousemove to display refresh rate via rAF
+        // Throttle pointermove to display refresh rate via rAF
         let pendingMove = null;
         let rafScheduled = false;
 
@@ -375,14 +365,12 @@
             }
         }
 
-        videoContainer.addEventListener('mousemove', (e) => {
+        videoContainer.addEventListener('pointermove', (e) => {
             const coords = getVideoCoords(e);
-            if (coords) {
-                pendingMove = { msg: { type: 'mouse_move', x: coords.x, y: coords.y } };
-                if (!rafScheduled) {
-                    rafScheduled = true;
-                    requestAnimationFrame(flushMove);
-                }
+            pendingMove = { msg: { type: 'mouse_move', x: coords.x, y: coords.y } };
+            if (!rafScheduled) {
+                rafScheduled = true;
+                requestAnimationFrame(flushMove);
             }
         });
 
