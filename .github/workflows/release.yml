@@ -178,53 +178,68 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $GST_VERSION = "1.26.1"
+          $GST_VERSION = "1.26.11"
           $BASE = "https://gstreamer.freedesktop.org/data/pkg/windows/$GST_VERSION/msvc"
           $RT = "gstreamer-1.0-msvc-x86_64-$GST_VERSION.msi"
           $DEV = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
+          $GST_ROOT = "C:\gstreamer\1.0\msvc_x86_64"
 
-          # Download with verbose output to see redirects/errors
           Write-Host "Downloading GStreamer runtime..."
-          & curl.exe -fSL --retry 3 -o "$env:TEMP\$RT" "$BASE/$RT"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer runtime" }
-          $rtSize = (Get-Item "$env:TEMP\$RT").Length / 1MB
-          Write-Host "Runtime MSI: $([math]::Round($rtSize,1)) MB"
-          if ($rtSize -lt 1) { throw "Runtime MSI too small ($rtSize MB) - likely not a valid MSI" }
-
+          curl.exe -fSL --retry 3 -o "$env:TEMP\$RT" "$BASE/$RT"
+          if ($LASTEXITCODE -ne 0) { throw "Download failed" }
           Write-Host "Downloading GStreamer devel..."
-          & curl.exe -fSL --retry 3 -o "$env:TEMP\$DEV" "$BASE/$DEV"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer devel" }
-          $devSize = (Get-Item "$env:TEMP\$DEV").Length / 1MB
-          Write-Host "Devel MSI: $([math]::Round($devSize,1)) MB"
-          if ($devSize -lt 1) { throw "Devel MSI too small ($devSize MB) - likely not a valid MSI" }
+          curl.exe -fSL --retry 3 -o "$env:TEMP\$DEV" "$BASE/$DEV"
+          if ($LASTEXITCODE -ne 0) { throw "Download failed" }
 
-          Write-Host "Installing GStreamer runtime..."
-          $rtProc = Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\$RT`" /quiet /norestart" -Wait -NoNewWindow -PassThru
-          Write-Host "Runtime install exit code: $($rtProc.ExitCode)"
+          # Extract MSIs using 7z (msiexec /quiet fails silently on CI runners)
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          $extractDir = "$env:TEMP\gst-extract"
+          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
 
-          Write-Host "Installing GStreamer devel..."
-          $devProc = Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\$DEV`" /quiet /norestart" -Wait -NoNewWindow -PassThru
-          Write-Host "Devel install exit code: $($devProc.ExitCode)"
+          Write-Host "Extracting runtime MSI..."
+          & $7z x "$env:TEMP\$RT" -o"$extractDir\rt" -y | Select-String "Everything is Ok"
+          Write-Host "Extracting devel MSI..."
+          & $7z x "$env:TEMP\$DEV" -o"$extractDir\dev" -y | Select-String "Everything is Ok"
 
-          # Check common install locations
-          Write-Host "=== Searching for GStreamer ==="
-          foreach ($p in @(
-            "C:\gstreamer",
-            "C:\Program Files\gstreamer",
-            "C:\Program Files (x86)\gstreamer",
-            "$env:LOCALAPPDATA\gstreamer"
-          )) {
-            if (Test-Path $p) {
-              Write-Host "FOUND: $p"
-              Get-ChildItem $p -Recurse -Depth 3 | Select-Object -First 20
-            }
+          # MSI extracts with internal directory structure — find the GStreamer root
+          # The files are under a path like: Program Files/gstreamer/1.0/msvc_x86_64/
+          $rtRoot = Get-ChildItem "$extractDir\rt" -Recurse -Filter "gstreamer-1.0.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($rtRoot) {
+            $srcRoot = $rtRoot.Directory.Parent.FullName  # go up from bin/
+            Write-Host "Found runtime at: $srcRoot"
+          } else {
+            # Try finding by directory structure
+            $srcRoot = Get-ChildItem "$extractDir\rt" -Recurse -Directory -Filter "msvc_x86_64" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($srcRoot) { $srcRoot = $srcRoot.FullName; Write-Host "Found runtime dir: $srcRoot" }
           }
 
-          # Also check registry for install location
-          $regPath = Get-ItemProperty "HKLM:\SOFTWARE\GStreamer" -ErrorAction SilentlyContinue
-          if ($regPath) { Write-Host "Registry: $($regPath | Out-String)" }
-          $regPath = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\GStreamer" -ErrorAction SilentlyContinue
-          if ($regPath) { Write-Host "Registry WOW64: $($regPath | Out-String)" }
+          $devRoot = Get-ChildItem "$extractDir\dev" -Recurse -Filter "glib-2.0.pc" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($devRoot) {
+            $devSrc = $devRoot.Directory.Parent.Parent.FullName  # go up from lib/pkgconfig/
+            Write-Host "Found devel at: $devSrc"
+          }
+
+          # Copy to expected location
+          New-Item -ItemType Directory -Path $GST_ROOT -Force | Out-Null
+          if ($srcRoot -and (Test-Path $srcRoot)) {
+            Write-Host "Copying runtime..."
+            Copy-Item "$srcRoot\*" $GST_ROOT -Recurse -Force
+          }
+          if ($devSrc -and (Test-Path $devSrc)) {
+            Write-Host "Copying devel..."
+            Copy-Item "$devSrc\*" $GST_ROOT -Recurse -Force
+          }
+
+          # Verify
+          if (Test-Path "$GST_ROOT\lib\pkgconfig\glib-2.0.pc") {
+            Write-Host "GStreamer installed successfully at $GST_ROOT"
+            Get-ChildItem "$GST_ROOT\lib\pkgconfig" -Filter "gst*" | Select-Object -First 5
+          } else {
+            Write-Host "ERROR: glib-2.0.pc not found after extraction"
+            Write-Host "=== Extract dir structure ==="
+            Get-ChildItem $extractDir -Recurse -Depth 5 | Select-Object -First 40
+            throw "GStreamer installation failed"
+          }
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -235,7 +250,6 @@ jobs:
           set PATH=C:\gstreamer\1.0\msvc_x86_64\bin;%PATH%
           set PKG_CONFIG=C:\Strawberry\perl\bin\pkg-config.bat
           set PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
-          "%PKG_CONFIG%" --cflags glib-2.0
           cargo build --release -p streamio
 
       - name: Bundle
@@ -246,11 +260,8 @@ jobs:
           $GST_PLUGINS = "$GST\lib\gstreamer-1.0"
 
           New-Item -ItemType Directory -Path "$DIST\lib\gstreamer-1.0" -Force | Out-Null
-
-          # Copy exe
           Copy-Item "target\release\streamio.exe" $DIST
 
-          # Required plugins
           $plugins = @(
             'gstcoreelements','gstapp','gstvideoconvertscale','gstvideorate',
             'gstvideoparsersbad','gsttypefindfunctions',
@@ -271,7 +282,6 @@ jobs:
             }
           }
 
-          # Copy all GStreamer runtime DLLs
           Get-ChildItem "$GST\bin" -Filter "*.dll" | ForEach-Object {
             Copy-Item $_.FullName $DIST
           }
@@ -280,11 +290,7 @@ jobs:
           Write-Host ("Bundle size: {0:F1} MB" -f $size)
 
       - name: Create archive
-        shell: powershell
-        run: |
-          Compress-Archive -Path "dist-windows\*" -DestinationPath "streamio-windows-x86_64.zip"
-          # Also create tar.gz for consistency
-          tar czf streamio-windows-x86_64.tar.gz -C dist-windows .
+        run: tar czf streamio-windows-x86_64.tar.gz -C dist-windows .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
