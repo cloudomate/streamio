@@ -199,6 +199,9 @@ jobs:
           Get-ChildItem "C:\gstreamer" -ErrorAction SilentlyContinue | Write-Host
           Write-Host "GStreamer installed"
 
+      - name: Install pkg-config
+        run: choco install pkgconfiglite -y
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
