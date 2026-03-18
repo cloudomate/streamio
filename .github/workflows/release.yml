@@ -163,9 +163,106 @@ jobs:
           name: streamio-linux-x86_64
           path: streamio-linux-x86_64.tar.gz
 
+  build-windows:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GStreamer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Download GStreamer MSVC runtime + dev installers
+          $GST_VERSION = "1.26.1"
+          $BASE_URL = "https://gstreamer.freedesktop.org/data/pkg/windows/$GST_VERSION/msvc"
+          $RUNTIME_MSI = "gstreamer-1.0-msvc-x86_64-$GST_VERSION.msi"
+          $DEV_MSI = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
+
+          Write-Host "Downloading GStreamer runtime..."
+          Invoke-WebRequest -Uri "$BASE_URL/$RUNTIME_MSI" -OutFile "$env:TEMP\$RUNTIME_MSI"
+          Write-Host "Downloading GStreamer devel..."
+          Invoke-WebRequest -Uri "$BASE_URL/$DEV_MSI" -OutFile "$env:TEMP\$DEV_MSI"
+
+          Write-Host "Installing GStreamer runtime..."
+          Start-Process msiexec.exe -ArgumentList "/i", "$env:TEMP\$RUNTIME_MSI", "/quiet", "/norestart", "INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer devel..."
+          Start-Process msiexec.exe -ArgumentList "/i", "$env:TEMP\$DEV_MSI", "/quiet", "/norestart", "INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64" -Wait -NoNewWindow
+
+          Write-Host "GStreamer installed at C:\gstreamer\1.0\msvc_x86_64"
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: cmd
+        run: |
+          set PATH=C:\gstreamer\1.0\msvc_x86_64\bin;%PATH%
+          set PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
+          cargo build --release -p streamio
+
+      - name: Bundle
+        shell: powershell
+        run: |
+          $GST = "C:\gstreamer\1.0\msvc_x86_64"
+          $DIST = "$env:GITHUB_WORKSPACE\dist-windows"
+          $GST_PLUGINS = "$GST\lib\gstreamer-1.0"
+
+          New-Item -ItemType Directory -Path "$DIST\lib\gstreamer-1.0" -Force | Out-Null
+
+          # Copy exe
+          Copy-Item "target\release\streamio.exe" $DIST
+
+          # Required plugins
+          $plugins = @(
+            'gstcoreelements','gstapp','gstvideoconvertscale','gstvideorate',
+            'gstvideoparsersbad','gsttypefindfunctions',
+            'gstrtp','gstrtpmanager','gstwebrtc','gstnice',
+            'gstdtls','gstsrtp','gstsctp','gstsdpelem',
+            'gstopus','gstaudioconvert','gstaudioresample',
+            'gstd3d11','gstwasapi','gstwasapi2','gstmediafoundation',
+            'gstnvcodec'
+          )
+
+          foreach ($p in $plugins) {
+            $f = Get-ChildItem $GST_PLUGINS -Filter "$p.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) {
+              Copy-Item $f.FullName "$DIST\lib\gstreamer-1.0\"
+              Write-Host "  plugin: $($f.Name)"
+            } else {
+              Write-Host "  MISSING (optional): $p"
+            }
+          }
+
+          # Copy all GStreamer runtime DLLs
+          Get-ChildItem "$GST\bin" -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName $DIST
+          }
+
+          $size = (Get-ChildItem $DIST -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+          Write-Host ("Bundle size: {0:F1} MB" -f $size)
+
+      - name: Create archive
+        shell: powershell
+        run: |
+          Compress-Archive -Path "dist-windows\*" -DestinationPath "streamio-windows-x86_64.zip"
+          # Also create tar.gz for consistency
+          tar czf streamio-windows-x86_64.tar.gz -C dist-windows .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamio-windows-x86_64
+          path: streamio-windows-x86_64.tar.gz
+
   release:
-    needs: [check, build-macos, build-linux]
-    if: always() && needs.check.outputs.exists != 'true' && (needs.build-macos.result == 'success' || needs.build-linux.result == 'success')
+    needs: [check, build-macos, build-linux, build-windows]
+    if: always() && needs.check.outputs.exists != 'true' && (needs.build-macos.result == 'success' || needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
