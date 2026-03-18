@@ -190,36 +190,50 @@ jobs:
           & curl.exe -L -o "$env:TEMP\$DEV" "$BASE/$DEV"
           if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer devel" }
 
-          Write-Host "Installing GStreamer runtime..."
-          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$RT","/quiet","/norestart" -Wait -NoNewWindow
-          Write-Host "Installing GStreamer devel..."
-          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$DEV","/quiet","/norestart" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer runtime (full)..."
+          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$RT","ADDLOCAL=ALL","/quiet","/norestart" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer devel (full)..."
+          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$DEV","ADDLOCAL=ALL","/quiet","/norestart" -Wait -NoNewWindow
 
-          # Verify install
-          Write-Host "GStreamer installed"
-          Get-ChildItem "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" -Filter "glib*" -ErrorAction SilentlyContinue
+          # Verify install — list bin for pkg-config and pkgconfig dir for .pc files
+          $gstBin = "C:\gstreamer\1.0\msvc_x86_64\bin"
+          $gstPc = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
+          Write-Host "=== GStreamer bin (pkg*) ==="
+          Get-ChildItem $gstBin -Filter "pkg*" -ErrorAction SilentlyContinue
+          Write-Host "=== .pc files (glib*) ==="
+          Get-ChildItem $gstPc -Filter "glib*" -ErrorAction SilentlyContinue
+          Write-Host "=== GStreamer installed ==="
 
       - name: Install pkg-config
-        run: choco install pkgconfiglite -y
-
-      - name: Verify pkg-config
         shell: powershell
         run: |
-          $env:PKG_CONFIG_PATH = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
-          Write-Host "pkg-config location:"
-          Get-Command pkg-config | Write-Host
-          Write-Host "Testing glib-2.0 lookup:"
-          & pkg-config --cflags glib-2.0 2>&1 | Write-Host
-          Write-Host "Exit code: $LASTEXITCODE"
+          # Check if GStreamer ships pkg-config
+          if (Test-Path "C:\gstreamer\1.0\msvc_x86_64\bin\pkg-config.exe") {
+            Write-Host "Using GStreamer's pkg-config"
+          } else {
+            Write-Host "GStreamer has no pkg-config, installing via chocolatey"
+            choco install pkgconfiglite -y
+          }
+
+      - name: Verify pkg-config
+        shell: cmd
+        run: |
+          set PATH=C:\gstreamer\1.0\msvc_x86_64\bin;%PATH%
+          set PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
+          echo PKG_CONFIG_PATH=%PKG_CONFIG_PATH%
+          where pkg-config
+          pkg-config --variable pc_path pkg-config
+          pkg-config --cflags glib-2.0
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
       - name: Build
-        shell: powershell
+        shell: cmd
         run: |
-          $env:PATH = "C:\gstreamer\1.0\msvc_x86_64\bin;$env:PATH"
-          $env:PKG_CONFIG_PATH = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
+          set PATH=C:\gstreamer\1.0\msvc_x86_64\bin;%PATH%
+          set PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
+          set PKG_CONFIG_LIBDIR=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
           cargo build --release -p streamio
 
       - name: Bundle
