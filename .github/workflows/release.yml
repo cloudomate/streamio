@@ -205,15 +205,21 @@ jobs:
           )
           Write-Host "Devel extract exit code: $($p.ExitCode)"
 
+          # msiexec /a extracts to PFiles64/gstreamer/... — move to expected path
+          $extracted = "C:\gstreamer\PFiles64\gstreamer\1.0\msvc_x86_64"
+          if (Test-Path $extracted) {
+            Write-Host "Moving from $extracted to $GST_ROOT"
+            New-Item -ItemType Directory -Path (Split-Path $GST_ROOT) -Force | Out-Null
+            Move-Item $extracted $GST_ROOT -Force
+            Remove-Item "C:\gstreamer\PFiles64" -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item "C:\gstreamer\VC" -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           # Verify
           if (Test-Path "$GST_ROOT\lib\pkgconfig\glib-2.0.pc") {
             Write-Host "GStreamer installed successfully at $GST_ROOT"
           } else {
-            Write-Host "ERROR: glib-2.0.pc not found"
-            Write-Host "Checking C:\gstreamer structure..."
-            Get-ChildItem "C:\gstreamer" -Recurse -Depth 4 -Directory | Select-Object -First 30
-            Get-ChildItem "C:\gstreamer" -Recurse -Filter "*.pc" | Select-Object -First 5
-            throw "GStreamer installation failed"
+            throw "GStreamer installation failed — glib-2.0.pc not found at $GST_ROOT\lib\pkgconfig\"
           }
 
       - name: Rust cache
