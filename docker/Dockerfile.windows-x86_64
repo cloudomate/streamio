@@ -33,11 +33,14 @@ RUN GST_ROOT=$(find /gst -name "gstreamer-1.0.pc" | head -1 | xargs dirname | se
     echo "PKG_CONFIG_ALLOW_CROSS=1" >> /etc/gst-env.sh
 
 # Cargo linker config for x86_64-pc-windows-gnu
-# posix variant avoids CRT symbol issues; -lm provides round()
+# posix variant avoids CRT symbol issues.
+# target-cpu=x86-64-v2 enables SSE4.1 so LLVM emits ROUNDSD instead of
+# calling C round(), avoiding the undefined-symbol link error on MinGW.
+# x86-64-v2 = SSE4.2 + POPCNT, supported on all x64 hardware since ~2009.
 RUN mkdir -p /root/.cargo && printf \
 '[target.x86_64-pc-windows-gnu]\n\
 linker = "x86_64-w64-mingw32-gcc-posix"\n\
-rustflags = ["-C", "link-arg=-lm"]\n' \
+rustflags = ["-C", "target-cpu=x86-64-v2"]\n' \
 > /root/.cargo/config.toml
 
 WORKDIR /workspace
