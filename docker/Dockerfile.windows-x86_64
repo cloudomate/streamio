@@ -1,0 +1,43 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl wget pkg-config ca-certificates \
+    gcc g++ \
+    gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+    msitools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust with Windows x86_64 target
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain stable --no-modify-path
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup target add x86_64-pc-windows-gnu
+
+# Download and extract GStreamer MinGW x86_64 dev package
+# gstreamer-rs 0.23 requires GStreamer >= 1.24; use latest stable 1.26.x
+ARG GST_VERSION=1.26.11
+RUN wget -q "https://gstreamer.freedesktop.org/data/pkg/windows/${GST_VERSION}/mingw/gstreamer-1.0-devel-mingw-x86_64-${GST_VERSION}.msi" \
+        -O /tmp/gst-devel.msi && \
+    mkdir -p /gst && \
+    msiextract /tmp/gst-devel.msi -C /gst && \
+    rm /tmp/gst-devel.msi
+
+# Find extraction root and fix Windows-style prefix= paths in .pc files
+RUN GST_ROOT=$(find /gst -name "gstreamer-1.0.pc" | head -1 | xargs dirname | sed 's|/lib/pkgconfig||') && \
+    echo "Found GStreamer at: $GST_ROOT" && \
+    find /gst -name "*.pc" -exec sed -i "s|^prefix=.*|prefix=${GST_ROOT}|" {} \; && \
+    echo "GST_ROOT=${GST_ROOT}" > /etc/gst-env.sh && \
+    echo "PKG_CONFIG_PATH=${GST_ROOT}/lib/pkgconfig" >> /etc/gst-env.sh && \
+    echo "PKG_CONFIG_ALLOW_CROSS=1" >> /etc/gst-env.sh
+
+# Cargo linker config for x86_64-pc-windows-gnu
+# posix variant avoids CRT symbol issues; -lm provides round()
+RUN mkdir -p /root/.cargo && printf \
+'[target.x86_64-pc-windows-gnu]\n\
+linker = "x86_64-w64-mingw32-gcc-posix"\n\
+rustflags = ["-C", "link-arg=-lm"]\n' \
+> /root/.cargo/config.toml
+
+WORKDIR /workspace
