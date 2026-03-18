@@ -178,16 +178,17 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $GST_VERSION = "1.26.1"
           $BASE = "https://gstreamer.freedesktop.org/data/pkg/windows/$GST_VERSION/msvc"
           $RT = "gstreamer-1.0-msvc-x86_64-$GST_VERSION.msi"
           $DEV = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
 
           Write-Host "Downloading GStreamer runtime..."
-          Invoke-WebRequest -Uri "$BASE/$RT" -OutFile "$env:TEMP\$RT" -UseBasicParsing
+          & curl.exe -L -o "$env:TEMP\$RT" "$BASE/$RT"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer runtime" }
           Write-Host "Downloading GStreamer devel..."
-          Invoke-WebRequest -Uri "$BASE/$DEV" -OutFile "$env:TEMP\$DEV" -UseBasicParsing
+          & curl.exe -L -o "$env:TEMP\$DEV" "$BASE/$DEV"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer devel" }
 
           Write-Host "Installing GStreamer runtime..."
           Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$RT","/quiet","/norestart" -Wait -NoNewWindow

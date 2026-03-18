@@ -56,7 +56,7 @@ elif [[ "$OS" == "Linux" ]]; then
 fi
 
 echo "=== Building release binary ==="
-cargo build --release
+cargo build --release -p streamio
 
 if [ ! -f "$BINARY" ]; then
     echo "ERROR: Binary not found at $BINARY"
