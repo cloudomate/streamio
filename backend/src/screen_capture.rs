@@ -35,47 +35,19 @@ impl ScreenStreamer {
         #[cfg(target_os = "windows")]
         let capture_src = Self::create_windows_capture(fps)?;
 
-        // Queue for buffering
-        let queue = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 3u32)
-            .property("max-size-time", 0u64)
-            .property("max-size-bytes", 0u32)
-            .build()?;
-
-        // Video conversion
+        // Video processing: convert colorspace/memory, encode to H.264
         let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
-
-        // Video scaling (optional - for bandwidth control)
-        let videoscale = gst::ElementFactory::make("videoscale").build()?;
-        let capsfilter = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    .field("framerate", gst::Fraction::new(fps as i32, 1))
-                    .build(),
-            )
+        let queue = gst::ElementFactory::make("queue")
+            .property("max-size-buffers", 2u32)
             .build()?;
-
-        // Another queue before encoder
-        let queue2 = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 3u32)
-            .build()?;
-
-        // H.264 encoder - try hardware first, fall back to software
         let encoder = Self::create_encoder()?;
-
-        // H.264 parser
         let h264parse = gst::ElementFactory::make("h264parse")
             .property("config-interval", -1i32)
             .build()?;
-
-        // RTP payloader
         let rtppay = gst::ElementFactory::make("rtph264pay")
             .property("config-interval", -1i32)
             .property_from_str("aggregate-mode", "zero-latency")
             .build()?;
-
-        // RTP caps filter
         let rtpcaps = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
@@ -86,41 +58,21 @@ impl ScreenStreamer {
                     .build(),
             )
             .build()?;
-
-        // WebRTC bin
         let webrtcbin = gst::ElementFactory::make("webrtcbin")
             .name("webrtcbin")
             .property_from_str("bundle-policy", "max-bundle")
             .property("stun-server", "stun://stun.l.google.com:19302")
             .build()?;
 
-        // Add all elements to pipeline
+        // Simplest possible pipeline — gst-launch proves this works on Windows:
+        // d3d11screencapturesrc ! videoconvert ! mfh264enc ! h264parse ! rtph264pay ! webrtcbin
         pipeline.add_many([
-            &capture_src,
-            &queue,
-            &videoconvert,
-            &videoscale,
-            &capsfilter,
-            &queue2,
-            &encoder,
-            &h264parse,
-            &rtppay,
-            &rtpcaps,
-            &webrtcbin,
+            &capture_src, &videoconvert, &queue, &encoder,
+            &h264parse, &rtppay, &rtpcaps, &webrtcbin,
         ])?;
-
-        // Link elements
         gst::Element::link_many([
-            &capture_src,
-            &queue,
-            &videoconvert,
-            &videoscale,
-            &capsfilter,
-            &queue2,
-            &encoder,
-            &h264parse,
-            &rtppay,
-            &rtpcaps,
+            &capture_src, &videoconvert, &queue, &encoder,
+            &h264parse, &rtppay, &rtpcaps,
         ])?;
 
         // Link video to webrtcbin
@@ -235,20 +187,42 @@ impl ScreenStreamer {
     }
 
     #[cfg(target_os = "windows")]
-    fn create_windows_capture(fps: u32) -> Result<gst::Element> {
-        // dx9screencapsrc or d3d11screencapturesrc for Windows
-        let src = gst::ElementFactory::make("d3d11screencapturesrc")
-            .property("show-cursor", true)
-            .build()
-            .or_else(|_| {
-                gst::ElementFactory::make("dx9screencapsrc")
-                    .property("cursor", true)
-                    .build()
-            })
-            .context("Failed to create Windows screen capture source")?;
+    fn create_windows_capture(_fps: u32) -> Result<gst::Element> {
+        let monitor_index: i32 = std::env::var("DISPLAY_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
-        tracing::info!("Using Windows screen capture");
-        Ok(src)
+        // Windows Graphics Capture API: captures at the compositor level, works on
+        // multi-GPU laptops (NVIDIA + AMD iGPU) where DXGI Desktop Duplication fails
+        // because it requires running on the adapter that owns the display output.
+        if let Ok(src) = gst::ElementFactory::make("d3d11screencapturesrc")
+            .property("show-cursor", true)
+            .property("do-timestamp", true)
+            .property("monitor-index", monitor_index)
+            .property_from_str("capture-api", "wgc")
+            .build()
+        {
+            tracing::info!("Using Windows Graphics Capture API on monitor {}", monitor_index);
+            return Ok(src);
+        }
+
+        // Fallback: DXGI Desktop Duplication
+        if let Ok(src) = gst::ElementFactory::make("d3d11screencapturesrc")
+            .property("show-cursor", true)
+            .property("do-timestamp", true)
+            .property("monitor-index", monitor_index)
+            .build()
+        {
+            tracing::info!("Using DXGI Desktop Duplication capture on monitor {}", monitor_index);
+            return Ok(src);
+        }
+
+        // Last resort: GDI-based capture
+        gst::ElementFactory::make("dx9screencapsrc")
+            .property("cursor", true)
+            .build()
+            .context("Failed to create any Windows screen capture source")
     }
 
     /// Add audio capture pipeline (system audio → WebRTC)
@@ -275,11 +249,26 @@ impl ScreenStreamer {
 
         #[cfg(target_os = "windows")]
         let audio_src = {
-            gst::ElementFactory::make("wasapisrc")
+            gst::ElementFactory::make("wasapi2src")
                 .property("do-timestamp", true)
+                .property("loopback", true)
                 .build()
-                .context("wasapisrc not available")?
+                .or_else(|_| {
+                    tracing::warn!("wasapi2src not available, falling back to wasapisrc");
+                    gst::ElementFactory::make("wasapisrc")
+                        .property("do-timestamp", true)
+                        .property("loopback", true)
+                        .build()
+                })
+                .context("No Windows audio source available")?
         };
+
+        // Queue to decouple audio capture from encoding
+        let audio_queue = gst::ElementFactory::make("queue")
+            .property("max-size-buffers", 10u32)
+            .property("max-size-time", 200_000_000u64) // 200ms
+            .property_from_str("leaky", "downstream")
+            .build()?;
 
         // Audio conversion and resampling
         let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
@@ -288,7 +277,6 @@ impl ScreenStreamer {
         // Opus encoder (required for WebRTC)
         let opusenc = gst::ElementFactory::make("opusenc")
             .property("bitrate", 64000i32)
-            .property("audio-type", 2051i32)  // Voice
             .build()
             .context("opusenc not available")?;
 
@@ -305,6 +293,7 @@ impl ScreenStreamer {
                     .field("media", "audio")
                     .field("encoding-name", "OPUS")
                     .field("payload", 111i32)
+                    .field("clock-rate", 48000i32)
                     .build(),
             )
             .build()?;
@@ -312,6 +301,7 @@ impl ScreenStreamer {
         // Add audio elements to pipeline
         pipeline.add_many([
             &audio_src,
+            &audio_queue,
             &audioconvert,
             &audioresample,
             &opusenc,
@@ -322,6 +312,7 @@ impl ScreenStreamer {
         // Link audio elements
         gst::Element::link_many([
             &audio_src,
+            &audio_queue,
             &audioconvert,
             &audioresample,
             &opusenc,
@@ -413,29 +404,46 @@ impl ScreenStreamer {
             return Ok(enc);
         }
 
-        // NVIDIA NVENC
-        if let Ok(enc) = gst::ElementFactory::make("nvh264enc")
-            .property("preset", 1u32)  // low-latency
-            .property("rc-mode", 2u32) // CBR
-            .property("zerolatency", true)
+        // Windows: Media Foundation H.264 encoder — available on all modern Windows systems.
+        // Automatically selects the best hardware encoder available (NVIDIA, AMD, Intel).
+        // Works with system-memory frames from videoconvert upstream.
+        #[cfg(target_os = "windows")]
+        if let Ok(enc) = gst::ElementFactory::make("mfh264enc")
+            .property("low-latency", true)
+            .property("gop-size", 60i32)
+            .property("bitrate", 4000u32)  // 4 Mbps
             .build()
         {
-            tracing::info!("Using NVIDIA NVENC hardware encoder");
+            tracing::info!("Using Windows Media Foundation H.264 encoder (hardware)");
             return Ok(enc);
         }
 
-        // Intel/AMD VAAPI
+        // Linux/non-Windows: try Intel QuickSync
+        #[cfg(not(target_os = "windows"))]
+        if let Ok(enc) = gst::ElementFactory::make("qsvh264enc").build() {
+            tracing::info!("Using Intel QuickSync encoder");
+            return Ok(enc);
+        }
+
+        // Linux: VAAPI (AMD/Intel on Linux)
+        #[cfg(not(target_os = "windows"))]
         if let Ok(enc) = gst::ElementFactory::make("vaapih264enc")
-            .property("rate-control", 2u32) // CBR
+            .property("rate-control", 2u32)
             .build()
         {
             tracing::info!("Using VAAPI hardware encoder");
             return Ok(enc);
         }
 
-        // Intel QuickSync
-        if let Ok(enc) = gst::ElementFactory::make("qsvh264enc").build() {
-            tracing::info!("Using Intel QuickSync encoder");
+        // Linux: NVIDIA NVENC
+        #[cfg(not(target_os = "windows"))]
+        if let Ok(enc) = gst::ElementFactory::make("nvh264enc")
+            .property_from_str("rc-mode", "cbr")
+            .property("gop-size", 60i32)
+            .property("zerolatency", true)
+            .build()
+        {
+            tracing::info!("Using NVIDIA NVENC hardware encoder");
             return Ok(enc);
         }
 
@@ -477,16 +485,40 @@ impl ScreenStreamer {
                 }
             };
 
-            let offer = reply
-                .value("offer")
-                .unwrap()
-                .get::<gst_webrtc::WebRTCSessionDescription>()
-                .unwrap();
+            let offer = match reply.value("offer") {
+                Ok(v) => match v.get::<gst_webrtc::WebRTCSessionDescription>() {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::error!("Create offer: failed to get WebRTCSessionDescription: {:?}", e);
+                        return;
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!("Create offer reply missing 'offer' field (pipeline shut down during negotiation)");
+                    return;
+                }
+            };
 
             webrtcbin
                 .emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
 
-            let sdp = offer.sdp().to_string();
+            // Fix the H.264 fmtp line in the SDP offer. The hardware encoder
+            // (mfh264enc) may advertise a high profile-level-id (e.g. 420432 =
+            // Level 5.0) that some browsers reject. Replace it with Constrained
+            // Baseline Level 3.1 (42e01f) which is universally supported.
+            // Also strip sprop-parameter-sets which can confuse browser parsers.
+            let mut sdp = offer.sdp().to_string();
+            // Replace the entire fmtp line with a clean one
+            let mut new_lines = Vec::new();
+            for line in sdp.lines() {
+                if line.starts_with("a=fmtp:96") {
+                    new_lines.push("a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_string());
+                } else {
+                    new_lines.push(line.to_string());
+                }
+            }
+            let sdp = new_lines.join("\r\n") + "\r\n";
+            tracing::debug!("SDP offer:\n{}", sdp);
             let _ = tx.send(SignalingMessage::Offer { sdp });
             tracing::info!("SDP offer sent");
         });
@@ -499,7 +531,7 @@ impl ScreenStreamer {
     pub fn handle_signaling(&self, msg: SignalingMessage) -> Result<()> {
         match msg {
             SignalingMessage::Answer { sdp } => {
-                tracing::info!("Received SDP answer");
+                tracing::debug!("SDP answer:\n{}", sdp);
                 let sdp = gstreamer_sdp::SDPMessage::parse_buffer(sdp.as_bytes())?;
                 let answer = gst_webrtc::WebRTCSessionDescription::new(
                     gst_webrtc::WebRTCSDPType::Answer,

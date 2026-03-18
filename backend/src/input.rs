@@ -13,21 +13,49 @@ pub struct InputController {
 
 impl InputController {
     pub fn new() -> Self {
+        // On Windows, ensure we are per-monitor DPI aware so that
+        // SetCursorPos coordinates match physical pixels (same space
+        // as the screen capture).
+        #[cfg(target_os = "windows")]
+        Self::set_dpi_aware();
+
         let enigo = Enigo::new(&Settings::default()).expect("Failed to create Enigo");
+
         Self {
             enigo: Mutex::new(enigo),
         }
     }
 
-    pub fn handle_event(&self, event: &InputEvent) {
-        let mut enigo = self.enigo.lock().unwrap();
+    #[cfg(target_os = "windows")]
+    fn set_dpi_aware() {
+        use std::ffi::c_void;
+        type DPI_AWARENESS_CONTEXT = *mut c_void;
+        const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT =
+            -4isize as DPI_AWARENESS_CONTEXT;
 
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetProcessDpiAwarenessContext(value: DPI_AWARENESS_CONTEXT) -> i32;
+        }
+
+        unsafe {
+            let result = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            if result != 0 {
+                tracing::info!("Set DPI awareness to per-monitor-v2");
+            } else {
+                tracing::warn!("Failed to set DPI awareness (may already be set)");
+            }
+        }
+    }
+
+    pub fn handle_event(&self, event: &InputEvent) {
         match event {
             InputEvent::MouseMove { x, y } => {
+                let mut enigo = self.enigo.lock().unwrap();
                 let _ = enigo.move_mouse(*x, *y, Coordinate::Abs);
             }
             InputEvent::MouseDown { button, x, y } => {
-                tracing::info!("Mouse down at ({}, {})", x, y);
+                let mut enigo = self.enigo.lock().unwrap();
                 let _ = enigo.move_mouse(*x, *y, Coordinate::Abs);
                 let btn = match button {
                     0 => Button::Left,
@@ -38,7 +66,7 @@ impl InputController {
                 let _ = enigo.button(btn, Direction::Press);
             }
             InputEvent::MouseUp { button, x, y } => {
-                tracing::info!("Mouse up at ({}, {})", x, y);
+                let mut enigo = self.enigo.lock().unwrap();
                 let _ = enigo.move_mouse(*x, *y, Coordinate::Abs);
                 let btn = match button {
                     0 => Button::Left,
@@ -52,12 +80,12 @@ impl InputController {
                 // Scroll amount (negative = scroll down, positive = scroll up)
                 let amount = (-*dy / 10.0) as i32;
                 if amount != 0 {
+                    let mut enigo = self.enigo.lock().unwrap();
                     let _ = enigo.scroll(amount, enigo::Axis::Vertical);
                 }
             }
             InputEvent::KeyDown { key, code: _, modifiers } => {
-                tracing::info!("Key down: {}", key);
-
+                let mut enigo = self.enigo.lock().unwrap();
                 // For single printable characters without modifiers, use text()
                 if key.len() == 1 && !modifiers.ctrl && !modifiers.alt && !modifiers.meta {
                     let _ = enigo.text(key);
