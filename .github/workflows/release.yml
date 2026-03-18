@@ -204,27 +204,6 @@ jobs:
           Get-ChildItem $gstPc -Filter "glib*" -ErrorAction SilentlyContinue
           Write-Host "=== GStreamer installed ==="
 
-      - name: Install pkg-config
-        shell: powershell
-        run: |
-          # Check if GStreamer ships pkg-config
-          if (Test-Path "C:\gstreamer\1.0\msvc_x86_64\bin\pkg-config.exe") {
-            Write-Host "Using GStreamer's pkg-config"
-          } else {
-            Write-Host "GStreamer has no pkg-config, installing via chocolatey"
-            choco install pkgconfiglite -y
-          }
-
-      - name: Verify pkg-config
-        shell: cmd
-        run: |
-          set PATH=C:\gstreamer\1.0\msvc_x86_64\bin;%PATH%
-          set PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
-          echo PKG_CONFIG_PATH=%PKG_CONFIG_PATH%
-          where pkg-config
-          pkg-config --variable pc_path pkg-config
-          pkg-config --cflags glib-2.0
-
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
@@ -232,8 +211,9 @@ jobs:
         shell: cmd
         run: |
           set PATH=C:\gstreamer\1.0\msvc_x86_64\bin;%PATH%
+          set PKG_CONFIG=C:\Strawberry\perl\bin\pkg-config.bat
           set PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
-          set PKG_CONFIG_LIBDIR=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig
+          "%PKG_CONFIG%" --cflags glib-2.0
           cargo build --release -p streamio
 
       - name: Bundle
