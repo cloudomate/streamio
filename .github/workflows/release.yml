@@ -191,53 +191,28 @@ jobs:
           curl.exe -fSL --retry 3 -o "$env:TEMP\$DEV" "$BASE/$DEV"
           if ($LASTEXITCODE -ne 0) { throw "Download failed" }
 
-          # Extract MSIs using 7z (msiexec /quiet fails silently on CI runners)
-          $7z = "C:\Program Files\7-Zip\7z.exe"
-          $extractDir = "$env:TEMP\gst-extract"
-          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+          # Use msiexec /a (administrative install) to extract files without registration.
+          # Regular /i silently fails on CI runners. /a extracts to TARGETDIR.
+          Write-Host "Extracting GStreamer runtime..."
+          $p = Start-Process msiexec.exe -Wait -NoNewWindow -PassThru -ArgumentList @(
+            "/a", "$env:TEMP\$RT", "/qn", "TARGETDIR=C:\gstreamer"
+          )
+          Write-Host "Runtime extract exit code: $($p.ExitCode)"
 
-          Write-Host "Extracting runtime MSI..."
-          & $7z x "$env:TEMP\$RT" -o"$extractDir\rt" -y | Select-String "Everything is Ok"
-          Write-Host "Extracting devel MSI..."
-          & $7z x "$env:TEMP\$DEV" -o"$extractDir\dev" -y | Select-String "Everything is Ok"
-
-          # MSI extracts with internal directory structure — find the GStreamer root
-          # The files are under a path like: Program Files/gstreamer/1.0/msvc_x86_64/
-          $rtRoot = Get-ChildItem "$extractDir\rt" -Recurse -Filter "gstreamer-1.0.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($rtRoot) {
-            $srcRoot = $rtRoot.Directory.Parent.FullName  # go up from bin/
-            Write-Host "Found runtime at: $srcRoot"
-          } else {
-            # Try finding by directory structure
-            $srcRoot = Get-ChildItem "$extractDir\rt" -Recurse -Directory -Filter "msvc_x86_64" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($srcRoot) { $srcRoot = $srcRoot.FullName; Write-Host "Found runtime dir: $srcRoot" }
-          }
-
-          $devRoot = Get-ChildItem "$extractDir\dev" -Recurse -Filter "glib-2.0.pc" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($devRoot) {
-            $devSrc = $devRoot.Directory.Parent.Parent.FullName  # go up from lib/pkgconfig/
-            Write-Host "Found devel at: $devSrc"
-          }
-
-          # Copy to expected location
-          New-Item -ItemType Directory -Path $GST_ROOT -Force | Out-Null
-          if ($srcRoot -and (Test-Path $srcRoot)) {
-            Write-Host "Copying runtime..."
-            Copy-Item "$srcRoot\*" $GST_ROOT -Recurse -Force
-          }
-          if ($devSrc -and (Test-Path $devSrc)) {
-            Write-Host "Copying devel..."
-            Copy-Item "$devSrc\*" $GST_ROOT -Recurse -Force
-          }
+          Write-Host "Extracting GStreamer devel..."
+          $p = Start-Process msiexec.exe -Wait -NoNewWindow -PassThru -ArgumentList @(
+            "/a", "$env:TEMP\$DEV", "/qn", "TARGETDIR=C:\gstreamer"
+          )
+          Write-Host "Devel extract exit code: $($p.ExitCode)"
 
           # Verify
           if (Test-Path "$GST_ROOT\lib\pkgconfig\glib-2.0.pc") {
             Write-Host "GStreamer installed successfully at $GST_ROOT"
-            Get-ChildItem "$GST_ROOT\lib\pkgconfig" -Filter "gst*" | Select-Object -First 5
           } else {
-            Write-Host "ERROR: glib-2.0.pc not found after extraction"
-            Write-Host "=== Extract dir structure ==="
-            Get-ChildItem $extractDir -Recurse -Depth 5 | Select-Object -First 40
+            Write-Host "ERROR: glib-2.0.pc not found"
+            Write-Host "Checking C:\gstreamer structure..."
+            Get-ChildItem "C:\gstreamer" -Recurse -Depth 4 -Directory | Select-Object -First 30
+            Get-ChildItem "C:\gstreamer" -Recurse -Filter "*.pc" | Select-Object -First 5
             throw "GStreamer installation failed"
           }
 
