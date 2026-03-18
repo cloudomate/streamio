@@ -184,25 +184,43 @@ jobs:
           $DEV = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
 
           Write-Host "Downloading GStreamer runtime..."
-          & curl.exe -L -o "$env:TEMP\$RT" "$BASE/$RT"
+          & curl.exe -fL -o "$env:TEMP\$RT" "$BASE/$RT"
           if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer runtime" }
+          $rtSize = (Get-Item "$env:TEMP\$RT").Length / 1MB
+          Write-Host "Runtime MSI: $([math]::Round($rtSize,1)) MB"
+
           Write-Host "Downloading GStreamer devel..."
-          & curl.exe -L -o "$env:TEMP\$DEV" "$BASE/$DEV"
+          & curl.exe -fL -o "$env:TEMP\$DEV" "$BASE/$DEV"
           if ($LASTEXITCODE -ne 0) { throw "Failed to download GStreamer devel" }
+          $devSize = (Get-Item "$env:TEMP\$DEV").Length / 1MB
+          Write-Host "Devel MSI: $([math]::Round($devSize,1)) MB"
 
-          Write-Host "Installing GStreamer runtime (full)..."
-          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$RT","ADDLOCAL=ALL","/quiet","/norestart" -Wait -NoNewWindow
-          Write-Host "Installing GStreamer devel (full)..."
-          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$DEV","ADDLOCAL=ALL","/quiet","/norestart" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer runtime..."
+          $rtLog = "$env:TEMP\gst-rt-install.log"
+          $p = Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$RT","/quiet","/norestart","/L*V","$rtLog" -Wait -NoNewWindow -PassThru
+          Write-Host "Runtime install exit code: $($p.ExitCode)"
 
-          # Verify install — list bin for pkg-config and pkgconfig dir for .pc files
-          $gstBin = "C:\gstreamer\1.0\msvc_x86_64\bin"
-          $gstPc = "C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig"
-          Write-Host "=== GStreamer bin (pkg*) ==="
-          Get-ChildItem $gstBin -Filter "pkg*" -ErrorAction SilentlyContinue
-          Write-Host "=== .pc files (glib*) ==="
-          Get-ChildItem $gstPc -Filter "glib*" -ErrorAction SilentlyContinue
-          Write-Host "=== GStreamer installed ==="
+          Write-Host "Installing GStreamer devel..."
+          $devLog = "$env:TEMP\gst-dev-install.log"
+          $p = Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$DEV","/quiet","/norestart","/L*V","$devLog" -Wait -NoNewWindow -PassThru
+          Write-Host "Devel install exit code: $($p.ExitCode)"
+
+          # Verify install
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          if (Test-Path $gstRoot) {
+            Write-Host "=== GStreamer root exists ==="
+            Write-Host "lib dir:"
+            Get-ChildItem "$gstRoot\lib" -ErrorAction SilentlyContinue | Select-Object -First 20
+            Write-Host "pkgconfig dir:"
+            Get-ChildItem "$gstRoot\lib\pkgconfig" -ErrorAction SilentlyContinue | Select-Object -First 10
+          } else {
+            Write-Host "ERROR: GStreamer root not found at $gstRoot"
+            Write-Host "Checking C:\gstreamer..."
+            Get-ChildItem "C:\gstreamer" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 30
+            # Show last 50 lines of devel install log
+            Write-Host "=== Devel install log (tail) ==="
+            Get-Content $devLog -Tail 50 -ErrorAction SilentlyContinue
+          }
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
