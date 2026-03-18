@@ -219,7 +219,7 @@ jobs:
           if (Test-Path "$GST_ROOT\lib\pkgconfig\glib-2.0.pc") {
             Write-Host "GStreamer installed successfully at $GST_ROOT"
           } else {
-            throw "GStreamer installation failed — glib-2.0.pc not found at $GST_ROOT\lib\pkgconfig\"
+            throw "GStreamer installation failed - glib-2.0.pc not found"
           }
 
       - name: Rust cache
