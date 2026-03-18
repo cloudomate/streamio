@@ -178,23 +178,25 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          # Download GStreamer MSVC runtime + dev installers
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $GST_VERSION = "1.26.1"
-          $BASE_URL = "https://gstreamer.freedesktop.org/data/pkg/windows/$GST_VERSION/msvc"
-          $RUNTIME_MSI = "gstreamer-1.0-msvc-x86_64-$GST_VERSION.msi"
-          $DEV_MSI = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
+          $BASE = "https://gstreamer.freedesktop.org/data/pkg/windows/$GST_VERSION/msvc"
+          $RT = "gstreamer-1.0-msvc-x86_64-$GST_VERSION.msi"
+          $DEV = "gstreamer-1.0-devel-msvc-x86_64-$GST_VERSION.msi"
 
           Write-Host "Downloading GStreamer runtime..."
-          Invoke-WebRequest -Uri "$BASE_URL/$RUNTIME_MSI" -OutFile "$env:TEMP\$RUNTIME_MSI"
+          Invoke-WebRequest -Uri "$BASE/$RT" -OutFile "$env:TEMP\$RT" -UseBasicParsing
           Write-Host "Downloading GStreamer devel..."
-          Invoke-WebRequest -Uri "$BASE_URL/$DEV_MSI" -OutFile "$env:TEMP\$DEV_MSI"
+          Invoke-WebRequest -Uri "$BASE/$DEV" -OutFile "$env:TEMP\$DEV" -UseBasicParsing
 
           Write-Host "Installing GStreamer runtime..."
-          Start-Process msiexec.exe -ArgumentList "/i", "$env:TEMP\$RUNTIME_MSI", "/quiet", "/norestart", "INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64" -Wait -NoNewWindow
+          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$RT","/quiet","/norestart" -Wait -NoNewWindow
           Write-Host "Installing GStreamer devel..."
-          Start-Process msiexec.exe -ArgumentList "/i", "$env:TEMP\$DEV_MSI", "/quiet", "/norestart", "INSTALLDIR=C:\gstreamer\1.0\msvc_x86_64" -Wait -NoNewWindow
+          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\$DEV","/quiet","/norestart" -Wait -NoNewWindow
 
-          Write-Host "GStreamer installed at C:\gstreamer\1.0\msvc_x86_64"
+          # Verify install
+          Get-ChildItem "C:\gstreamer" -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "GStreamer installed"
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
