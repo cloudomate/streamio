@@ -35,10 +35,13 @@ impl ScreenStreamer {
         #[cfg(target_os = "windows")]
         let capture_src = Self::create_windows_capture(fps)?;
 
-        // Video processing: convert colorspace/memory, encode to H.264
+        // Video processing: convert colorspace, encode to H.264
         let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
         let queue = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 2u32)
+            .property("max-size-buffers", 1u32)
+            .property("max-size-time", 0u64)
+            .property("max-size-bytes", 0u32)
+            .property_from_str("leaky", "downstream")
             .build()?;
         let encoder = Self::create_encoder()?;
         let h264parse = gst::ElementFactory::make("h264parse")
@@ -64,8 +67,7 @@ impl ScreenStreamer {
             .property("stun-server", "stun://stun.l.google.com:19302")
             .build()?;
 
-        // Simplest possible pipeline — gst-launch proves this works on Windows:
-        // d3d11screencapturesrc ! videoconvert ! mfh264enc ! h264parse ! rtph264pay ! webrtcbin
+        // Pipeline: capture → convert → queue → encode → parse → rtp → caps → webrtc
         pipeline.add_many([
             &capture_src, &videoconvert, &queue, &encoder,
             &h264parse, &rtppay, &rtpcaps, &webrtcbin,
@@ -75,7 +77,7 @@ impl ScreenStreamer {
             &h264parse, &rtppay, &rtpcaps,
         ])?;
 
-        // Link video to webrtcbin
+        // Link capsfilter to webrtcbin via request pad
         let rtpcaps_src = rtpcaps.static_pad("src")
             .context("capsfilter missing src pad")?;
         let webrtc_video_sink = webrtcbin.request_pad_simple("sink_%u")
@@ -149,7 +151,7 @@ impl ScreenStreamer {
 
         let src = gst::ElementFactory::make("avfvideosrc")
             .property("capture-screen", true)
-            .property("capture-screen-cursor", true)
+            .property("capture-screen-cursor", false)
             .property("do-timestamp", true)
             .property("device-index", display_index)
             .build()
@@ -197,7 +199,7 @@ impl ScreenStreamer {
         // multi-GPU laptops (NVIDIA + AMD iGPU) where DXGI Desktop Duplication fails
         // because it requires running on the adapter that owns the display output.
         if let Ok(src) = gst::ElementFactory::make("d3d11screencapturesrc")
-            .property("show-cursor", true)
+            .property("show-cursor", false)
             .property("do-timestamp", true)
             .property("monitor-index", monitor_index)
             .property_from_str("capture-api", "wgc")
@@ -209,7 +211,7 @@ impl ScreenStreamer {
 
         // Fallback: DXGI Desktop Duplication
         if let Ok(src) = gst::ElementFactory::make("d3d11screencapturesrc")
-            .property("show-cursor", true)
+            .property("show-cursor", false)
             .property("do-timestamp", true)
             .property("monitor-index", monitor_index)
             .build()
@@ -220,7 +222,7 @@ impl ScreenStreamer {
 
         // Last resort: GDI-based capture
         gst::ElementFactory::make("dx9screencapsrc")
-            .property("cursor", true)
+            .property("cursor", false)
             .build()
             .context("Failed to create any Windows screen capture source")
     }
@@ -410,11 +412,12 @@ impl ScreenStreamer {
         #[cfg(target_os = "windows")]
         if let Ok(enc) = gst::ElementFactory::make("mfh264enc")
             .property("low-latency", true)
-            .property("gop-size", 15i32)   // keyframe every 0.5s for fast recovery
-            .property("bitrate", 6000u32)  // 6 Mbps
+            .property("gop-size", 1i32)      // every frame is IDR — zero encoder buffering
+            .property("bitrate", 15000u32)   // 15 Mbps (higher for all-IDR)
+            .property("max-bitrate", 20000u32)
             .build()
         {
-            tracing::info!("Using Windows Media Foundation H.264 encoder (hardware)");
+            tracing::info!("Using Windows Media Foundation H.264 encoder (all-IDR mode)");
             return Ok(enc);
         }
 
@@ -462,7 +465,8 @@ impl ScreenStreamer {
 
     /// Start the pipeline
     pub fn start(&self) -> Result<()> {
-        self.pipeline.set_state(gst::State::Playing)?;
+        self.pipeline.set_state(gst::State::Playing)
+            .map_err(|_| anyhow::anyhow!("Failed to start pipeline"))?;
         tracing::info!("Screen capture pipeline started");
         Ok(())
     }
@@ -539,6 +543,8 @@ impl ScreenStreamer {
                 );
                 self.webrtcbin
                     .emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
+
+                tracing::info!("SDP answer set");
             }
             SignalingMessage::Ice {
                 candidate,
@@ -560,7 +566,7 @@ impl ScreenStreamer {
 
     /// Stop the pipeline
     pub fn stop(&self) -> Result<()> {
-        self.pipeline.set_state(gst::State::Null)?;
+        let _ = self.pipeline.set_state(gst::State::Null);
         tracing::info!("Screen capture pipeline stopped");
         Ok(())
     }

@@ -49,14 +49,14 @@
             background: #000;
             position: relative;
             overflow: hidden;
-            cursor: none;
+            cursor: default;
         }
         #video {
             max-width: 100%;
             max-height: 100%;
             object-fit: contain;
             background: #000;
-            cursor: none;
+            cursor: default;
         }
         .controls {
             background: #161b22;
@@ -177,9 +177,15 @@
                 console.log('Track received:', event.track.kind, 'streams:', event.streams.length);
                 if (event.track.kind === 'video') {
                     video.srcObject = event.streams[0];
-                    // Minimise browser jitter buffer (Chrome 107+)
-                    if (event.receiver && event.receiver.jitterBufferTarget !== undefined) {
-                        event.receiver.jitterBufferTarget = 0;
+                    // Aggressively minimize jitter buffer for low latency
+                    if (event.receiver) {
+                        if (event.receiver.jitterBufferTarget !== undefined) {
+                            event.receiver.jitterBufferTarget = 0;
+                        }
+                        // Chrome 114+: hint minimum playout delay
+                        if (event.receiver.playoutDelayHint !== undefined) {
+                            event.receiver.playoutDelayHint = 0;
+                        }
                     }
                     // Try to play, may need user interaction for audio
                     video.play().catch(e => {
@@ -258,7 +264,7 @@
             if (document.fullscreenElement) {
                 document.exitFullscreen();
             } else {
-                video.requestFullscreen();
+                videoContainer.requestFullscreen();
             }
         }
 
@@ -352,26 +358,15 @@
             e.preventDefault();
         });
 
-        // Throttle pointermove to display refresh rate via rAF
-        let pendingMove = null;
-        let rafScheduled = false;
-
-        function flushMove() {
-            rafScheduled = false;
-            if (pendingMove) {
-                sendInput(pendingMove.msg);
-                coordsEl.textContent = `${pendingMove.msg.x},${pendingMove.msg.y} | vid:${video.videoWidth}x${video.videoHeight}`;
-                pendingMove = null;
-            }
-        }
-
         videoContainer.addEventListener('pointermove', (e) => {
-            const coords = getVideoCoords(e);
-            pendingMove = { msg: { type: 'mouse_move', x: coords.x, y: coords.y } };
-            if (!rafScheduled) {
-                rafScheduled = true;
-                requestAnimationFrame(flushMove);
+            // Send coalesced events for smooth remote cursor
+            const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+            for (const pe of events) {
+                const coords = getVideoCoords(pe);
+                sendInput({ type: 'mouse_move', x: coords.x, y: coords.y });
             }
+            const coords = getVideoCoords(e);
+            coordsEl.textContent = `${coords.x},${coords.y} | vid:${video.videoWidth}x${video.videoHeight}`;
         });
 
         video.addEventListener('wheel', (e) => {
@@ -387,23 +382,32 @@
         // Auto-focus video when clicking
         video.addEventListener('click', () => video.focus());
 
-        // Capture keyboard globally when video has focus or mouse is over it
+        // Capture keyboard globally when video has focus, mouse is over it, or in fullscreen
         let videoHasFocus = false;
 
         video.addEventListener('mouseenter', () => { videoHasFocus = true; video.focus(); });
-        video.addEventListener('mouseleave', () => { videoHasFocus = false; });
+        video.addEventListener('mouseleave', () => { if (!document.fullscreenElement) videoHasFocus = false; });
         video.addEventListener('focus', () => { videoHasFocus = true; });
-        video.addEventListener('blur', () => { videoHasFocus = false; });
+        video.addEventListener('blur', () => { if (!document.fullscreenElement) videoHasFocus = false; });
+        videoContainer.addEventListener('mouseenter', () => { videoHasFocus = true; video.focus(); });
+
+        // Re-focus video on fullscreen enter/exit
+        document.addEventListener('fullscreenchange', () => {
+            if (document.fullscreenElement) {
+                videoHasFocus = true;
+                video.focus();
+            }
+        });
 
         document.addEventListener('keydown', (e) => {
-            if (videoHasFocus) {
+            if (videoHasFocus || document.fullscreenElement) {
                 sendInput({ type: 'key_down', key: e.key, code: e.code, modifiers: getModifiers(e) });
                 e.preventDefault();
             }
         });
 
         document.addEventListener('keyup', (e) => {
-            if (videoHasFocus) {
+            if (videoHasFocus || document.fullscreenElement) {
                 sendInput({ type: 'key_up', key: e.key, code: e.code, modifiers: getModifiers(e) });
                 e.preventDefault();
             }
@@ -418,14 +422,34 @@
             };
         }
 
-        // Stats
+        // Stats + latency watchdog
+        let lastFramesDecoded = 0;
+        let lastJitterBufferDelay = 0;
         setInterval(() => {
             if (pc) {
                 pc.getStats().then(stats => {
                     stats.forEach(report => {
                         if (report.type === 'inbound-rtp' && report.kind === 'video') {
                             const fps = report.framesPerSecond || 0;
-                            statsEl.textContent = `${fps.toFixed(0)} fps | ${report.framesDecoded || 0} frames`;
+                            const decoded = report.framesDecoded || 0;
+                            const jitterDelay = report.jitterBufferDelay || 0;
+                            const jitterEmitted = report.jitterBufferEmittedCount || 1;
+                            const avgJitterMs = ((jitterDelay - lastJitterBufferDelay) / Math.max(1, decoded - lastFramesDecoded) * 1000).toFixed(0);
+                            statsEl.textContent = `${fps.toFixed(0)} fps | buf:${avgJitterMs}ms`;
+                            lastFramesDecoded = decoded;
+                            lastJitterBufferDelay = jitterDelay;
+
+                            // If jitter buffer exceeds 500ms, force resync
+                            if (avgJitterMs > 500 && video.buffered.length > 0) {
+                                console.warn('Jitter buffer too high (' + avgJitterMs + 'ms), forcing resync');
+                                // Re-request keyframe via PLI
+                                pc.getReceivers().forEach(r => {
+                                    if (r.track && r.track.kind === 'video') {
+                                        if (r.jitterBufferTarget !== undefined) r.jitterBufferTarget = 0;
+                                        if (r.playoutDelayHint !== undefined) r.playoutDelayHint = 0;
+                                    }
+                                });
+                            }
                         }
                     });
                 });

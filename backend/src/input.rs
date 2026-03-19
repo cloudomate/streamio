@@ -84,45 +84,17 @@ impl InputController {
                     let _ = enigo.scroll(amount, enigo::Axis::Vertical);
                 }
             }
-            InputEvent::KeyDown { key, code: _, modifiers } => {
-                let mut enigo = self.enigo.lock().unwrap();
-                // For single printable characters without modifiers, use text()
-                if key.len() == 1 && !modifiers.ctrl && !modifiers.alt && !modifiers.meta {
-                    let _ = enigo.text(key);
-                } else if let Some(k) = map_key(key) {
-                    // Handle modifier keys
-                    if modifiers.meta {
-                        let _ = enigo.key(enigo::Key::Meta, Direction::Press);
-                    }
-                    if modifiers.ctrl {
-                        let _ = enigo.key(enigo::Key::Control, Direction::Press);
-                    }
-                    if modifiers.alt {
-                        let _ = enigo.key(enigo::Key::Alt, Direction::Press);
-                    }
-                    if modifiers.shift {
-                        let _ = enigo.key(enigo::Key::Shift, Direction::Press);
-                    }
-
-                    let _ = enigo.key(k, Direction::Click);
-
-                    // Release modifiers
-                    if modifiers.shift {
-                        let _ = enigo.key(enigo::Key::Shift, Direction::Release);
-                    }
-                    if modifiers.alt {
-                        let _ = enigo.key(enigo::Key::Alt, Direction::Release);
-                    }
-                    if modifiers.ctrl {
-                        let _ = enigo.key(enigo::Key::Control, Direction::Release);
-                    }
-                    if modifiers.meta {
-                        let _ = enigo.key(enigo::Key::Meta, Direction::Release);
-                    }
+            InputEvent::KeyDown { key, code: _, modifiers: _ } => {
+                if let Some(k) = map_key(key) {
+                    let mut enigo = self.enigo.lock().unwrap();
+                    let _ = enigo.key(k, Direction::Press);
                 }
             }
-            InputEvent::KeyUp { key: _, code: _, modifiers: _ } => {
-                // Key up is handled in KeyDown with Click
+            InputEvent::KeyUp { key, code: _, modifiers: _ } => {
+                if let Some(k) = map_key(key) {
+                    let mut enigo = self.enigo.lock().unwrap();
+                    let _ = enigo.key(k, Direction::Release);
+                }
             }
         }
     }
@@ -130,6 +102,12 @@ impl InputController {
 
 fn map_key(key: &str) -> Option<enigo::Key> {
     match key {
+        // Modifier keys
+        "Shift" => Some(enigo::Key::Shift),
+        "Control" => Some(enigo::Key::Control),
+        "Alt" => Some(enigo::Key::Alt),
+        "Meta" => Some(enigo::Key::Meta),
+        // Navigation / editing
         "Enter" => Some(enigo::Key::Return),
         "Escape" => Some(enigo::Key::Escape),
         "Backspace" => Some(enigo::Key::Backspace),
@@ -140,10 +118,12 @@ fn map_key(key: &str) -> Option<enigo::Key> {
         "ArrowLeft" => Some(enigo::Key::LeftArrow),
         "ArrowRight" => Some(enigo::Key::RightArrow),
         "Delete" => Some(enigo::Key::Delete),
+        "Insert" => Some(enigo::Key::Other(0x2D)),
         "Home" => Some(enigo::Key::Home),
         "End" => Some(enigo::Key::End),
         "PageUp" => Some(enigo::Key::PageUp),
         "PageDown" => Some(enigo::Key::PageDown),
+        // Function keys
         "F1" => Some(enigo::Key::F1),
         "F2" => Some(enigo::Key::F2),
         "F3" => Some(enigo::Key::F3),
@@ -156,7 +136,10 @@ fn map_key(key: &str) -> Option<enigo::Key> {
         "F10" => Some(enigo::Key::F10),
         "F11" => Some(enigo::Key::F11),
         "F12" => Some(enigo::Key::F12),
+        // Lock keys
         "CapsLock" => Some(enigo::Key::CapsLock),
+        "NumLock" => Some(enigo::Key::Other(0x90)),
+        "ScrollLock" => Some(enigo::Key::Other(0x91)),
         // Single character keys
         s if s.len() == 1 => {
             let c = s.chars().next().unwrap();
