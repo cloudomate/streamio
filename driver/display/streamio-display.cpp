@@ -1,73 +1,97 @@
 /*
- * Streamio Virtual Display Driver (IddCx UMDF2)
+ * Streamio Virtual Display Driver (IddCx 1.2, UMDF2)
  *
  * Creates virtual monitors on demand via IOCTL. Each monitor appears as a
  * real display in Windows — GStreamer's d3d11screencapturesrc can capture it
  * independently by monitor-index.
  *
- * Based on Microsoft IddCx sample and Virtual-Display-Driver project.
+ * Based on Microsoft IddSampleDriver and Virtual-Display-Driver project.
  *
  * Key architecture:
  *   - UMDF2 driver (user-mode, no BSOD risk)
  *   - IddCx framework handles display adapter + monitor lifecycle
  *   - User-mode control via DeviceIoControl (IOCTL_DISPLAY_CREATE/DESTROY/LIST)
- *   - Swapchain: IddCx provides frames, we release them immediately
- *     (capture is done by GStreamer, not by this driver)
+ *   - Swapchain: IddCx provides frames via event handle, we acquire+release
+ *     to keep the pipeline flowing (GStreamer captures via DXGI independently)
  */
 
 #include <windows.h>
+#include <bugcodes.h>
+#include <wudfwdm.h>
 #include <wdf.h>
-
-/* IddCx headers */
 #include <IddCx.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <d3dkmthk.h>
+#include <stdio.h>
 
 #include "streamio-display.h"
 
-/* ── Forward declarations ─────────────────────────────────────────── */
+/* Instantiate our GUID (DEFINE_GUID in the header only declares extern) */
+extern "C" const GUID GUID_DEVINTERFACE_STREAMIO_DISPLAY =
+    { 0xB7E3D5A2, 0x4F1C, 0x8E6D,
+      { 0xA9, 0xC0, 0x2B, 0x5D, 0x7F, 0x0E, 0x3A, 0x1C } };
 
-extern "C" DRIVER_INITIALIZE DriverEntry;
-EVT_WDF_DRIVER_DEVICE_ADD  EvtDeviceAdd;
-EVT_WDF_DEVICE_D0_ENTRY    EvtDeviceD0Entry;
-
-EVT_IDD_CX_ADAPTER_INIT_FINISHED     EvtAdapterInitFinished;
-EVT_IDD_CX_ADAPTER_COMMIT_MODES      EvtAdapterCommitModes;
-EVT_IDD_CX_MONITOR_GET_DEFAULT_DESCRIPTION_MODES EvtMonitorGetDefaultModes;
-EVT_IDD_CX_MONITOR_QUERY_TARGET_MODES EvtMonitorQueryTargetModes;
-EVT_IDD_CX_PARSE_MONITOR_DESCRIPTION  EvtParseMonitorDescription;
-EVT_IDD_CX_MONITOR_ASSIGN_SWAPCHAIN   EvtMonitorAssignSwapChain;
-EVT_IDD_CX_MONITOR_UNASSIGN_SWAPCHAIN EvtMonitorUnassignSwapChain;
-
-/* ── Per-monitor context ──────────────────────────────────────────── */
+/* ── Per-monitor context (stored as WDF object context on IDDCX_MONITOR) ── */
 
 typedef struct _MONITOR_CONTEXT {
     UINT32 display_id;
     UINT32 width;
     UINT32 height;
     UINT32 refresh_hz;
-    BOOLEAN active;
-    IDDCX_MONITOR monitor_object;
+    IDDCX_SWAPCHAIN swapchain;
+    HANDLE swapchain_event;
     HANDLE swapchain_thread;
     volatile BOOLEAN stop_thread;
 } MONITOR_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MONITOR_CONTEXT, GetMonitorContext)
 
 /* ── Per-adapter (device) context ─────────────────────────────────── */
 
 typedef struct _DEVICE_CONTEXT {
     IDDCX_ADAPTER adapter;
     WDFDEVICE device;
-    MONITOR_CONTEXT monitors[STREAMIO_MAX_DISPLAYS];
+    /* Track active monitors by slot */
+    IDDCX_MONITOR monitors[STREAMIO_MAX_DISPLAYS];
+    UINT32 widths[STREAMIO_MAX_DISPLAYS];
+    UINT32 heights[STREAMIO_MAX_DISPLAYS];
+    UINT32 refresh_rates[STREAMIO_MAX_DISPLAYS];
+    BOOLEAN active[STREAMIO_MAX_DISPLAYS];
     UINT32 monitor_count;
-    WDFWAITLOCK lock;
 } DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 
+/* ── D3D device singleton (for swapchain processing) ──────────────── */
+
+static ID3D11Device* g_d3d_device = nullptr;
+
+static ID3D11Device* GetOrCreateD3DDevice()
+{
+    if (g_d3d_device) return g_d3d_device;
+
+    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
+    D3D_FEATURE_LEVEL level_out;
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        levels, 1, D3D11_SDK_VERSION,
+        &g_d3d_device, &level_out, nullptr
+    );
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            levels, 1, D3D11_SDK_VERSION,
+            &g_d3d_device, &level_out, nullptr
+        );
+    }
+    return g_d3d_device;
+}
+
 /* ── EDID generation ──────────────────────────────────────────────── */
 
-/*
- * Generate a minimal EDID block (128 bytes) for a virtual display.
- * This tells Windows the monitor's preferred resolution/refresh rate.
- */
 static void GenerateEdid(BYTE edid[128], UINT32 width, UINT32 height, UINT32 refresh_hz, UINT32 display_id)
 {
     memset(edid, 0, 128);
@@ -76,115 +100,76 @@ static void GenerateEdid(BYTE edid[128], UINT32 width, UINT32 height, UINT32 ref
     edid[0] = 0x00; edid[1] = 0xFF; edid[2] = 0xFF; edid[3] = 0xFF;
     edid[4] = 0xFF; edid[5] = 0xFF; edid[6] = 0xFF; edid[7] = 0x00;
 
-    /* Manufacturer: "STR" (Streamio) - encoded as 3x5-bit chars */
-    /* S=19(0x13), T=20(0x14), R=18(0x12) */
+    /* Manufacturer: "STR" (Streamio) */
     edid[8] = (BYTE)(((0x13 - 1) << 2) | ((0x14 - 1) >> 3));
     edid[9] = (BYTE)(((0x14 - 1) << 5) | (0x12 - 1));
 
-    /* Product code (unique per display) */
-    edid[10] = (BYTE)(0x01 + display_id);
-    edid[11] = 0x00;
-
-    /* Serial number */
+    edid[10] = (BYTE)(0x01 + display_id); edid[11] = 0x00;
     edid[12] = 0x01; edid[13] = 0x00; edid[14] = 0x00; edid[15] = 0x00;
 
-    /* Week 1, Year 2024 (offset from 1990) */
-    edid[16] = 1;
-    edid[17] = 34;
-
-    /* EDID version 1.3 */
-    edid[18] = 1;
+    edid[16] = 1;  /* week */
+    edid[17] = 34; /* year 2024 */
+    edid[18] = 1;  /* EDID 1.3 */
     edid[19] = 3;
+    edid[20] = 0x80; /* digital */
 
-    /* Digital input, 8 bits per color */
-    edid[20] = 0x80;
-
-    /* Screen size: cm (approximate) */
-    edid[21] = (BYTE)(width * 53 / 1920);   /* ~53cm for 1920 width = ~24" */
+    edid[21] = (BYTE)(width * 53 / 1920);
     edid[22] = (BYTE)(height * 30 / 1080);
-
-    /* Gamma 2.2 */
-    edid[23] = 120;
-
-    /* Supported features */
+    edid[23] = 120; /* gamma 2.2 */
     edid[24] = 0x0A;
 
-    /* Chromaticity coordinates (sRGB standard) */
+    /* sRGB chromaticity */
     edid[25] = 0xEE; edid[26] = 0x91; edid[27] = 0xA3; edid[28] = 0x54;
     edid[29] = 0x4C; edid[30] = 0x99; edid[31] = 0x26; edid[32] = 0x0F;
     edid[33] = 0x50; edid[34] = 0x54;
 
     /* Standard timings: unused */
-    for (int i = 38; i < 54; i += 2) {
-        edid[i] = 0x01;
-        edid[i + 1] = 0x01;
-    }
+    for (int i = 38; i < 54; i += 2) { edid[i] = 0x01; edid[i + 1] = 0x01; }
 
-    /* Detailed Timing Descriptor #1 — preferred mode */
-    UINT32 pixel_clock = (UINT32)((UINT64)width * height * refresh_hz / 10000);
+    /* Detailed Timing Descriptor #1 */
+    UINT32 htotal = width + width / 5;
+    UINT32 vtotal = height + height / 20;
+    UINT32 pixel_clock = (UINT32)((UINT64)htotal * vtotal * refresh_hz / 10000);
+    UINT32 hblank = htotal - width;
+    UINT32 vblank = vtotal - height;
+
     edid[54] = (BYTE)(pixel_clock & 0xFF);
     edid[55] = (BYTE)((pixel_clock >> 8) & 0xFF);
-
-    UINT32 hblank = width * 20 / 100;  /* ~20% blanking */
-    UINT32 vblank = height * 5 / 100;
-
     edid[56] = (BYTE)(width & 0xFF);
     edid[57] = (BYTE)(hblank & 0xFF);
     edid[58] = (BYTE)(((width >> 8) << 4) | ((hblank >> 8) & 0x0F));
-
     edid[59] = (BYTE)(height & 0xFF);
     edid[60] = (BYTE)(vblank & 0xFF);
     edid[61] = (BYTE)(((height >> 8) << 4) | ((vblank >> 8) & 0x0F));
+    edid[62] = 48; edid[63] = 32; edid[64] = 0x35; edid[65] = 0x00;
 
-    /* Hsync/Vsync offsets and widths */
-    edid[62] = 48;  /* h front porch */
-    edid[63] = 32;  /* h sync width */
-    edid[64] = 0x35; /* v front porch + sync width */
-    edid[65] = 0x00;
-
-    /* Image size (mm) */
     UINT32 h_mm = width * 530 / 1920;
     UINT32 v_mm = height * 300 / 1080;
     edid[66] = (BYTE)(h_mm & 0xFF);
     edid[67] = (BYTE)(v_mm & 0xFF);
     edid[68] = (BYTE)(((h_mm >> 8) << 4) | ((v_mm >> 8) & 0x0F));
+    edid[69] = 0; edid[70] = 0;
+    edid[71] = 0x18; /* non-interlaced, digital */
 
-    /* No border */
-    edid[69] = 0;
-    edid[70] = 0;
-
-    /* Signal: non-interlaced, digital */
-    edid[71] = 0x18;
-
-    /* Descriptor #2: Monitor name "Streamio N" */
+    /* Monitor name */
     edid[72] = 0; edid[73] = 0; edid[74] = 0; edid[75] = 0xFC; edid[76] = 0;
     char name[14];
     int name_len = sprintf_s(name, sizeof(name), "Streamio %u", display_id);
-    for (int i = 0; i < 13; i++) {
-        edid[77 + i] = (i < name_len) ? (BYTE)name[i] : 0x0A;
-    }
+    for (int i = 0; i < 13; i++) edid[77 + i] = (i < name_len) ? (BYTE)name[i] : 0x0A;
 
-    /* Descriptor #3: Monitor range limits */
+    /* Range limits */
     edid[90] = 0; edid[91] = 0; edid[92] = 0; edid[93] = 0xFD; edid[94] = 0;
-    edid[95] = (BYTE)(refresh_hz - 1);  /* min V rate */
-    edid[96] = (BYTE)(refresh_hz + 1);  /* max V rate */
-    edid[97] = 30;   /* min H rate kHz */
-    edid[98] = 150;  /* max H rate kHz */
-    edid[99] = 25;   /* max pixel clock / 10 MHz */
-    edid[100] = 0x00; /* no GTF */
+    edid[95] = (BYTE)(refresh_hz - 1);
+    edid[96] = (BYTE)(refresh_hz + 1);
+    edid[97] = 30; edid[98] = 150; edid[99] = 25; edid[100] = 0x00;
 
-    /* Descriptor #4: Serial number string */
+    /* Serial */
     edid[108] = 0; edid[109] = 0; edid[110] = 0; edid[111] = 0xFF; edid[112] = 0;
     char serial[14];
     int serial_len = sprintf_s(serial, sizeof(serial), "STRVD%07u", display_id);
-    for (int i = 0; i < 13; i++) {
-        edid[113 + i] = (i < serial_len) ? (BYTE)serial[i] : 0x0A;
-    }
+    for (int i = 0; i < 13; i++) edid[113 + i] = (i < serial_len) ? (BYTE)serial[i] : 0x0A;
 
-    /* Extension count = 0 */
-    edid[126] = 0;
-
-    /* Checksum */
+    edid[126] = 0; /* no extensions */
     BYTE sum = 0;
     for (int i = 0; i < 127; i++) sum += edid[i];
     edid[127] = (BYTE)(256 - sum);
@@ -192,66 +177,21 @@ static void GenerateEdid(BYTE edid[128], UINT32 width, UINT32 height, UINT32 ref
 
 /* ── Swapchain processing thread ──────────────────────────────────── */
 
-/*
- * IddCx provides a swapchain when the OS renders to our virtual display.
- * We must acquire and release frames — otherwise the OS stalls.
- * We don't need the frame data (GStreamer captures via DXGI independently).
- */
 static DWORD WINAPI SwapchainThread(LPVOID param)
 {
     MONITOR_CONTEXT* ctx = (MONITOR_CONTEXT*)param;
-    IDARG_IN_SWAPCHAINSETDEVICE set_device = {};
-
-    /* We need a D3D device to process the swapchain */
-    /* For now, create a minimal D3D11 device */
-    ID3D11Device* d3d_device = nullptr;
-    D3D_FEATURE_LEVEL feature_level;
-    HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        0, nullptr, 0, D3D11_SDK_VERSION,
-        &d3d_device, &feature_level, nullptr
-    );
-
-    if (FAILED(hr)) {
-        /* Try WARP (software) if no hardware */
-        hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
-            0, nullptr, 0, D3D11_SDK_VERSION,
-            &d3d_device, &feature_level, nullptr
-        );
-    }
-
-    if (FAILED(hr) || !d3d_device) {
-        return 1;
-    }
-
-    /* Tell IddCx which D3D device to use for this swapchain */
-    set_device.pDevice = (IUnknown*)d3d_device;
-    /* Note: IddCxSwapChainSetDevice is called within the assign callback context,
-       not here. The thread just processes frames. */
 
     while (!ctx->stop_thread) {
-        /* Acquire and immediately release frames to keep the pipeline flowing */
-        IDXGIResource* resource = nullptr;
+        DWORD wait = WaitForSingleObject(ctx->swapchain_event, 100);
+        if (wait != WAIT_OBJECT_0) continue;
+        if (ctx->stop_thread) break;
+
         IDARG_OUT_RELEASEANDACQUIREBUFFER buf_out = {};
-        IDARG_IN_RELEASEANDACQUIREBUFFER buf_in = {};
-        buf_in.Reason = IDDCX_UPDATE_REASON_OTHER;
 
-        /* This blocks until a frame is available or timeout */
-        NTSTATUS status = IddCxSwapChainReleaseAndAcquireBuffer(
-            ctx->monitor_object, &buf_in, &buf_out);
-
+        NTSTATUS status = IddCxSwapChainReleaseAndAcquireBuffer(ctx->swapchain, &buf_out);
         if (NT_SUCCESS(status)) {
-            /* Release immediately — we don't process frames */
-            IddCxSwapChainFinishedProcessingFrame(ctx->monitor_object);
-        } else {
-            /* No frame available or error — sleep briefly */
-            Sleep(16);  /* ~60fps timing */
+            IddCxSwapChainFinishedProcessingFrame(ctx->swapchain);
         }
-    }
-
-    if (d3d_device) {
-        d3d_device->Release();
     }
 
     return 0;
@@ -259,17 +199,18 @@ static DWORD WINAPI SwapchainThread(LPVOID param)
 
 /* ── IddCx Callbacks ─────────────────────────────────────────────── */
 
-NTSTATUS EvtAdapterInitFinished(IDDCX_ADAPTER adapter, const IDARG_IN_ADAPTER_INIT_FINISHED* args)
+NTSTATUS EvtAdapterInitFinished(
+    IDDCX_ADAPTER adapter,
+    const IDARG_IN_ADAPTER_INIT_FINISHED* args)
 {
-    if (!NT_SUCCESS(args->AdapterInitStatus)) {
-        return args->AdapterInitStatus;
-    }
-    return STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(adapter);
+    return args->AdapterInitStatus;
 }
 
-NTSTATUS EvtAdapterCommitModes(IDDCX_ADAPTER adapter, const IDARG_IN_COMMITMODES2* args)
+NTSTATUS EvtAdapterCommitModes(
+    IDDCX_ADAPTER adapter,
+    const IDARG_IN_COMMITMODES* args)
 {
-    /* OS is committing display modes — acknowledge */
     UNREFERENCED_PARAMETER(adapter);
     UNREFERENCED_PARAMETER(args);
     return STATUS_SUCCESS;
@@ -279,10 +220,51 @@ NTSTATUS EvtParseMonitorDescription(
     const IDARG_IN_PARSEMONITORDESCRIPTION* in_args,
     IDARG_OUT_PARSEMONITORDESCRIPTION* out_args)
 {
-    /* We provide EDID — IddCx will parse it for us if we return NOT_HANDLED,
-       or we can parse it ourselves. Let IddCx handle it. */
-    UNREFERENCED_PARAMETER(in_args);
-    out_args->MonitorDescription.Size = 0;
+    /* Parse our EDID to extract the single preferred mode */
+    if (in_args->MonitorDescription.DataSize < 128 || !in_args->MonitorDescription.pData) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    BYTE* edid = (BYTE*)in_args->MonitorDescription.pData;
+
+    /* Extract resolution from DTD #1 (bytes 54-71) */
+    UINT32 width = edid[56] | ((edid[58] >> 4) << 8);
+    UINT32 height = edid[59] | ((edid[61] >> 4) << 8);
+    UINT32 pixel_clock = edid[54] | (edid[55] << 8); /* in 10kHz */
+
+    UINT32 hblank = edid[57] | ((edid[58] & 0x0F) << 8);
+    UINT32 vblank = edid[60] | ((edid[61] & 0x0F) << 8);
+    UINT32 htotal = width + hblank;
+    UINT32 vtotal = height + vblank;
+
+    UINT32 refresh_hz = 60;
+    if (htotal > 0 && vtotal > 0 && pixel_clock > 0) {
+        refresh_hz = (UINT32)((UINT64)pixel_clock * 10000 / ((UINT64)htotal * vtotal));
+    }
+
+    /* Build monitor mode */
+    IDDCX_MONITOR_MODE mode = {};
+    mode.Size = sizeof(mode);
+    mode.Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+    mode.MonitorVideoSignalInfo.totalSize.cx = htotal;
+    mode.MonitorVideoSignalInfo.totalSize.cy = vtotal;
+    mode.MonitorVideoSignalInfo.activeSize.cx = width;
+    mode.MonitorVideoSignalInfo.activeSize.cy = height;
+    mode.MonitorVideoSignalInfo.vSyncFreq.Numerator = refresh_hz;
+    mode.MonitorVideoSignalInfo.vSyncFreq.Denominator = 1;
+    mode.MonitorVideoSignalInfo.hSyncFreq.Numerator = (UINT32)((UINT64)pixel_clock * 10000 / htotal);
+    mode.MonitorVideoSignalInfo.hSyncFreq.Denominator = 1;
+    mode.MonitorVideoSignalInfo.pixelRate = (UINT64)pixel_clock * 10000;
+    mode.MonitorVideoSignalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+
+    if (in_args->MonitorModeBufferInputCount == 0) {
+        out_args->MonitorModeBufferOutputCount = 1;
+    } else {
+        in_args->pMonitorModes[0] = mode;
+        out_args->MonitorModeBufferOutputCount = 1;
+    }
+    out_args->PreferredMonitorModeIdx = 0;
+
     return STATUS_SUCCESS;
 }
 
@@ -291,10 +273,11 @@ NTSTATUS EvtMonitorGetDefaultModes(
     const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* in_args,
     IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* out_args)
 {
+    /* Not used — we provide EDID and parse it in EvtParseMonitorDescription */
     UNREFERENCED_PARAMETER(monitor);
     UNREFERENCED_PARAMETER(in_args);
-    /* Return 0 — we use target modes instead */
     out_args->DefaultMonitorModeBufferOutputCount = 0;
+    out_args->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
     return STATUS_SUCCESS;
 }
 
@@ -303,28 +286,34 @@ NTSTATUS EvtMonitorQueryTargetModes(
     const IDARG_IN_QUERYTARGETMODES* in_args,
     IDARG_OUT_QUERYTARGETMODES* out_args)
 {
-    /* Find our monitor context */
-    /* For simplicity, report one target mode matching our configured resolution */
+    MONITOR_CONTEXT* ctx = GetMonitorContext(monitor);
 
-    /* TODO: look up context from monitor handle to get width/height/refresh */
+    UINT32 w = ctx->width;
+    UINT32 h = ctx->height;
+    UINT32 hz = ctx->refresh_hz;
+
+    UINT32 htotal = w + w / 5;
+    UINT32 vtotal = h + h / 20;
+    UINT64 pixel_rate = (UINT64)htotal * vtotal * hz;
+
     IDDCX_TARGET_MODE mode = {};
     mode.Size = sizeof(mode);
-    mode.TargetVideoSignalInfo.totalSize.cx = 1920;
-    mode.TargetVideoSignalInfo.totalSize.cy = 1080;
-    mode.TargetVideoSignalInfo.activeSize.cx = 1920;
-    mode.TargetVideoSignalInfo.activeSize.cy = 1080;
-    mode.TargetVideoSignalInfo.vSyncFreq.Numerator = 60;
-    mode.TargetVideoSignalInfo.vSyncFreq.Denominator = 1;
-    mode.TargetVideoSignalInfo.hSyncFreq.Numerator = 67500;
-    mode.TargetVideoSignalInfo.hSyncFreq.Denominator = 1;
-    mode.TargetVideoSignalInfo.scanLineOrdering = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-    mode.TargetVideoSignalInfo.pixelRate = 148500000;
-    mode.TargetVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.totalSize.cx = htotal;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.totalSize.cy = vtotal;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cx = w;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.activeSize.cy = h;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.vSyncFreq.Numerator = hz;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.vSyncFreq.Denominator = 1;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.hSyncFreq.Numerator = (UINT32)(pixel_rate / htotal);
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.hSyncFreq.Denominator = 1;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.pixelRate = pixel_rate;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
+    mode.TargetVideoSignalInfo.targetVideoSignalInfo.AdditionalSignalInfo.vSyncFreqDivider = 1;
 
-    if (in_args->TargetModeBufferInputCount >= 1) {
-        in_args->pTargetModes[0] = mode;
+    if (in_args->TargetModeBufferInputCount == 0) {
         out_args->TargetModeBufferOutputCount = 1;
     } else {
+        in_args->pTargetModes[0] = mode;
         out_args->TargetModeBufferOutputCount = 1;
     }
 
@@ -335,26 +324,51 @@ NTSTATUS EvtMonitorAssignSwapChain(
     IDDCX_MONITOR monitor,
     const IDARG_IN_SETSWAPCHAIN* args)
 {
-    /* OS assigned a swapchain — start processing thread */
-    /* TODO: find monitor context and start SwapchainThread */
-    UNREFERENCED_PARAMETER(monitor);
-    UNREFERENCED_PARAMETER(args);
+    MONITOR_CONTEXT* ctx = GetMonitorContext(monitor);
+
+    ctx->swapchain = args->hSwapChain;
+    ctx->swapchain_event = args->hNextSurfaceAvailable;
+    ctx->stop_thread = FALSE;
+
+    /* Tell IddCx which D3D device processes this swapchain */
+    ID3D11Device* dev = GetOrCreateD3DDevice();
+    if (dev) {
+        IDXGIDevice* dxgi_dev = nullptr;
+        HRESULT hr = dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev);
+        if (SUCCEEDED(hr) && dxgi_dev) {
+            IDARG_IN_SWAPCHAINSETDEVICE set_dev = {};
+            set_dev.pDevice = dxgi_dev;
+            IddCxSwapChainSetDevice(args->hSwapChain, &set_dev);
+            dxgi_dev->Release();
+        }
+    }
+
+    /* Start frame processing thread */
+    ctx->swapchain_thread = CreateThread(nullptr, 0, SwapchainThread, ctx, 0, nullptr);
+
     return STATUS_SUCCESS;
 }
 
 NTSTATUS EvtMonitorUnassignSwapChain(IDDCX_MONITOR monitor)
 {
-    /* OS unassigned swapchain — stop processing thread */
-    UNREFERENCED_PARAMETER(monitor);
+    MONITOR_CONTEXT* ctx = GetMonitorContext(monitor);
+
+    ctx->stop_thread = TRUE;
+    if (ctx->swapchain_thread) {
+        WaitForSingleObject(ctx->swapchain_thread, 5000);
+        CloseHandle(ctx->swapchain_thread);
+        ctx->swapchain_thread = nullptr;
+    }
+    ctx->swapchain = nullptr;
+    ctx->swapchain_event = nullptr;
+
     return STATUS_SUCCESS;
 }
 
-/* ── IOCTL handler — create/destroy virtual displays ──────────────── */
+/* ── IOCTL handler (via IDD_CX_CLIENT_CONFIG.EvtIddCxDeviceIoControl) ── */
 
-EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
-
-void EvtIoDeviceControl(
-    WDFQUEUE queue,
+void EvtDeviceIoControl(
+    WDFDEVICE device,
     WDFREQUEST request,
     size_t output_length,
     size_t input_length,
@@ -363,11 +377,8 @@ void EvtIoDeviceControl(
     UNREFERENCED_PARAMETER(output_length);
     UNREFERENCED_PARAMETER(input_length);
 
-    WDFDEVICE device = WdfIoQueueGetDevice(queue);
     DEVICE_CONTEXT* ctx = GetDeviceContext(device);
     NTSTATUS status = STATUS_INVALID_PARAMETER;
-
-    WdfWaitLockAcquire(ctx->lock, NULL);
 
     switch (ioctl_code) {
     case IOCTL_DISPLAY_CREATE: {
@@ -376,7 +387,6 @@ void EvtIoDeviceControl(
 
         status = WdfRequestRetrieveInputBuffer(request, sizeof(*req), (PVOID*)&req, NULL);
         if (!NT_SUCCESS(status)) break;
-
         status = WdfRequestRetrieveOutputBuffer(request, sizeof(*resp), (PVOID*)&resp, NULL);
         if (!NT_SUCCESS(status)) break;
 
@@ -385,59 +395,69 @@ void EvtIoDeviceControl(
             break;
         }
 
-        /* Find a free slot */
+        /* Find free slot */
         UINT32 slot = STREAMIO_MAX_DISPLAYS;
         for (UINT32 i = 0; i < STREAMIO_MAX_DISPLAYS; i++) {
-            if (!ctx->monitors[i].active) {
-                slot = i;
-                break;
-            }
+            if (!ctx->active[i]) { slot = i; break; }
         }
         if (slot == STREAMIO_MAX_DISPLAYS) {
             status = STATUS_INSUFFICIENT_RESOURCES;
             break;
         }
 
-        /* Create the IddCx monitor */
-        IDDCX_MONITOR_INFO monitor_info = {};
-        monitor_info.Size = sizeof(monitor_info);
-        monitor_info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
-        monitor_info.ConnectorIndex = slot;
-
         /* Generate EDID */
         BYTE edid[128];
         GenerateEdid(edid, req->width, req->height, req->refresh_hz, slot);
 
-        monitor_info.MonitorDescription.Size = sizeof(monitor_info.MonitorDescription);
-        monitor_info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-        monitor_info.MonitorDescription.DataSize = 128;
-        monitor_info.MonitorDescription.pData = edid;
+        /* Create monitor */
+        IDDCX_MONITOR_INFO mon_info = {};
+        mon_info.Size = sizeof(mon_info);
+        mon_info.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
+        mon_info.ConnectorIndex = slot;
+        mon_info.MonitorDescription.Size = sizeof(mon_info.MonitorDescription);
+        mon_info.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+        mon_info.MonitorDescription.DataSize = 128;
+        mon_info.MonitorDescription.pData = edid;
+
+        /* Set up object attributes to attach MONITOR_CONTEXT */
+        WDF_OBJECT_ATTRIBUTES mon_attrs;
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&mon_attrs, MONITOR_CONTEXT);
 
         IDARG_IN_MONITORCREATE create_in = {};
-        create_in.ObjectAttributes = WDF_NO_OBJECT_ATTRIBUTES;
-        create_in.pMonitorInfo = &monitor_info;
+        create_in.ObjectAttributes = &mon_attrs;
+        create_in.pMonitorInfo = &mon_info;
 
         IDARG_OUT_MONITORCREATE create_out = {};
         status = IddCxMonitorCreate(ctx->adapter, &create_in, &create_out);
+        if (!NT_SUCCESS(status)) break;
 
-        if (NT_SUCCESS(status)) {
-            ctx->monitors[slot].display_id = slot;
-            ctx->monitors[slot].width = req->width;
-            ctx->monitors[slot].height = req->height;
-            ctx->monitors[slot].refresh_hz = req->refresh_hz;
-            ctx->monitors[slot].active = TRUE;
-            ctx->monitors[slot].monitor_object = create_out.MonitorObject;
-            ctx->monitors[slot].stop_thread = FALSE;
-            ctx->monitor_count++;
+        /* Initialize monitor context */
+        MONITOR_CONTEXT* mon_ctx = GetMonitorContext(create_out.MonitorObject);
+        mon_ctx->display_id = slot;
+        mon_ctx->width = req->width;
+        mon_ctx->height = req->height;
+        mon_ctx->refresh_hz = req->refresh_hz;
+        mon_ctx->swapchain = nullptr;
+        mon_ctx->swapchain_event = nullptr;
+        mon_ctx->swapchain_thread = nullptr;
+        mon_ctx->stop_thread = FALSE;
 
-            /* Tell IddCx the monitor arrived (connected) */
-            IDARG_OUT_MONITORARRIVAL arrival_out = {};
-            IddCxMonitorArrival(create_out.MonitorObject, &arrival_out);
+        /* Notify IddCx that the monitor is connected */
+        IDARG_OUT_MONITORARRIVAL arrival_out = {};
+        status = IddCxMonitorArrival(create_out.MonitorObject, &arrival_out);
+        if (!NT_SUCCESS(status)) break;
 
-            resp->display_id = slot;
-            resp->status = 0;
-            WdfRequestSetInformation(request, sizeof(*resp));
-        }
+        /* Update device state */
+        ctx->monitors[slot] = create_out.MonitorObject;
+        ctx->widths[slot] = req->width;
+        ctx->heights[slot] = req->height;
+        ctx->refresh_rates[slot] = req->refresh_hz;
+        ctx->active[slot] = TRUE;
+        ctx->monitor_count++;
+
+        resp->display_id = slot;
+        resp->status = 0;
+        WdfRequestSetInformation(request, sizeof(*resp));
         break;
     }
 
@@ -446,21 +466,15 @@ void EvtIoDeviceControl(
         status = WdfRequestRetrieveInputBuffer(request, sizeof(*req), (PVOID*)&req, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        if (req->display_id >= STREAMIO_MAX_DISPLAYS || !ctx->monitors[req->display_id].active) {
+        if (req->display_id >= STREAMIO_MAX_DISPLAYS || !ctx->active[req->display_id]) {
             status = STATUS_NOT_FOUND;
             break;
         }
 
-        MONITOR_CONTEXT* mon = &ctx->monitors[req->display_id];
-        mon->stop_thread = TRUE;
-
-        /* Tell IddCx the monitor departed */
-        IddCxMonitorDeparture(mon->monitor_object);
-
-        mon->active = FALSE;
-        mon->monitor_object = nullptr;
+        IddCxMonitorDeparture(ctx->monitors[req->display_id]);
+        ctx->active[req->display_id] = FALSE;
+        ctx->monitors[req->display_id] = nullptr;
         ctx->monitor_count--;
-
         status = STATUS_SUCCESS;
         break;
     }
@@ -473,11 +487,11 @@ void EvtIoDeviceControl(
         memset(resp, 0, sizeof(*resp));
         UINT32 count = 0;
         for (UINT32 i = 0; i < STREAMIO_MAX_DISPLAYS; i++) {
-            if (ctx->monitors[i].active) {
+            if (ctx->active[i]) {
                 resp->displays[count].display_id = i;
-                resp->displays[count].width = ctx->monitors[i].width;
-                resp->displays[count].height = ctx->monitors[i].height;
-                resp->displays[count].refresh_hz = ctx->monitors[i].refresh_hz;
+                resp->displays[count].width = ctx->widths[i];
+                resp->displays[count].height = ctx->heights[i];
+                resp->displays[count].refresh_hz = ctx->refresh_rates[i];
                 resp->displays[count].active = 1;
                 count++;
             }
@@ -493,55 +507,22 @@ void EvtIoDeviceControl(
         break;
     }
 
-    WdfWaitLockRelease(ctx->lock);
     WdfRequestComplete(request, status);
 }
 
 /* ── Device setup ─────────────────────────────────────────────────── */
 
-NTSTATUS EvtDeviceD0Entry(WDFDEVICE device, WDF_POWER_STATE PreviousState)
-{
-    UNREFERENCED_PARAMETER(PreviousState);
-
-    DEVICE_CONTEXT* ctx = GetDeviceContext(device);
-
-    /* Initialize the IddCx adapter */
-    IDD_CX_CLIENT_CONFIG config = {};
-    config.Size = sizeof(config);
-    config.EvtIddCxAdapterInitFinished = EvtAdapterInitFinished;
-    config.EvtIddCxAdapterCommitModes = EvtAdapterCommitModes;
-    config.EvtIddCxParseMonitorDescription = EvtParseMonitorDescription;
-    config.EvtIddCxMonitorGetDefaultDescriptionModes = EvtMonitorGetDefaultModes;
-    config.EvtIddCxMonitorQueryTargetModes = EvtMonitorQueryTargetModes;
-    config.EvtIddCxMonitorAssignSwapChain = EvtMonitorAssignSwapChain;
-    config.EvtIddCxMonitorUnassignSwapChain = EvtMonitorUnassignSwapChain;
-
-    NTSTATUS status = IddCxDeviceInitConfig(nullptr, &config);
-    if (!NT_SUCCESS(status)) return status;
-
-    IDARG_IN_ADAPTER_INIT adapter_init = {};
-    adapter_init.WdfDevice = device;
-    adapter_init.pCaps = nullptr; /* Use defaults */
-
-    IDARG_OUT_ADAPTER_INIT adapter_out = {};
-    status = IddCxAdapterInitAsync(&adapter_init, &adapter_out);
-    if (NT_SUCCESS(status)) {
-        ctx->adapter = adapter_out.AdapterObject;
-    }
-
-    return status;
-}
-
 NTSTATUS EvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
 {
     UNREFERENCED_PARAMETER(driver);
 
-    /* Configure IddCx device */
+    /* IddCx must configure the device BEFORE WdfDeviceCreate */
     IDD_CX_CLIENT_CONFIG idd_config = {};
     idd_config.Size = sizeof(idd_config);
+    idd_config.EvtIddCxDeviceIoControl = EvtDeviceIoControl;
+    idd_config.EvtIddCxParseMonitorDescription = EvtParseMonitorDescription;
     idd_config.EvtIddCxAdapterInitFinished = EvtAdapterInitFinished;
     idd_config.EvtIddCxAdapterCommitModes = EvtAdapterCommitModes;
-    idd_config.EvtIddCxParseMonitorDescription = EvtParseMonitorDescription;
     idd_config.EvtIddCxMonitorGetDefaultDescriptionModes = EvtMonitorGetDefaultModes;
     idd_config.EvtIddCxMonitorQueryTargetModes = EvtMonitorQueryTargetModes;
     idd_config.EvtIddCxMonitorAssignSwapChain = EvtMonitorAssignSwapChain;
@@ -550,7 +531,7 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
     NTSTATUS status = IddCxDeviceInitConfig(device_init, &idd_config);
     if (!NT_SUCCESS(status)) return status;
 
-    /* Device attributes with context */
+    /* Create the WDF device with our context */
     WDF_OBJECT_ATTRIBUTES attrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, DEVICE_CONTEXT);
 
@@ -562,26 +543,11 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT device_init)
     memset(ctx, 0, sizeof(*ctx));
     ctx->device = device;
 
-    /* Create a lock for monitor array access */
-    WDF_OBJECT_ATTRIBUTES lock_attrs;
-    WDF_OBJECT_ATTRIBUTES_INIT(&lock_attrs);
-    lock_attrs.ParentObject = device;
-    WdfWaitLockCreate(&lock_attrs, &ctx->lock);
-
-    /* Create device interface for user-mode control */
+    /* Create device interface for user-mode control (display-ctl) */
     status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_STREAMIO_DISPLAY, NULL);
     if (!NT_SUCCESS(status)) return status;
 
-    /* Create default I/O queue for IOCTLs */
-    WDF_IO_QUEUE_CONFIG queue_config;
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queue_config, WdfIoQueueDispatchSequential);
-    queue_config.EvtIoDeviceControl = EvtIoDeviceControl;
-
-    WDFQUEUE queue;
-    status = WdfIoQueueCreate(device, &queue_config, WDF_NO_OBJECT_ATTRIBUTES, &queue);
-    if (!NT_SUCCESS(status)) return status;
-
-    /* Initialize adapter */
+    /* Initialize the IddCx adapter */
     IDDCX_ADAPTER_CAPS caps = {};
     caps.Size = sizeof(caps);
     caps.MaxMonitorsSupported = STREAMIO_MAX_DISPLAYS;

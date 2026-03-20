@@ -20,7 +20,10 @@ PnpLockdown = 1
 %DeviceName% = StreamioDisplay_Install, Root\StreamioDisplay
 
 [StreamioDisplay_Install]
-; UMDF driver — no .sys
+CopyFiles = StreamioDisplay_CopyFiles
+
+[StreamioDisplay_CopyFiles]
+streamio-display.dll
 
 [StreamioDisplay_Install.HW]
 AddReg = StreamioDisplay_HW_AddReg
