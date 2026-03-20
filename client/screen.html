@@ -145,8 +145,8 @@
                 statusText.textContent = 'Disconnected';
                 connecting = false;
                 if (pc) { pc.close(); pc = null; }
-                // Only reconnect if not manually disconnected
-                setTimeout(connect, 3000);
+                // Fast reconnect — server closes WS on desktop switch
+                setTimeout(connect, 500);
             };
 
             ws.onerror = (err) => {
@@ -236,6 +236,11 @@
                 if (pc.connectionState === 'connected') {
                     statusDot.classList.add('connected');
                     statusText.textContent = 'Streaming';
+                } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                    console.log('WebRTC connection lost, reconnecting...');
+                    statusDot.classList.remove('connected');
+                    statusText.textContent = 'Reconnecting...';
+                    reconnect();
                 }
             };
 
@@ -432,9 +437,9 @@
                         if (report.type === 'inbound-rtp' && report.kind === 'video') {
                             const fps = report.framesPerSecond || 0;
                             const decoded = report.framesDecoded || 0;
+                            const newFrames = decoded - lastFramesDecoded;
                             const jitterDelay = report.jitterBufferDelay || 0;
-                            const jitterEmitted = report.jitterBufferEmittedCount || 1;
-                            const avgJitterMs = ((jitterDelay - lastJitterBufferDelay) / Math.max(1, decoded - lastFramesDecoded) * 1000).toFixed(0);
+                            const avgJitterMs = ((jitterDelay - lastJitterBufferDelay) / Math.max(1, newFrames) * 1000).toFixed(0);
                             statsEl.textContent = `${fps.toFixed(0)} fps | buf:${avgJitterMs}ms`;
                             lastFramesDecoded = decoded;
                             lastJitterBufferDelay = jitterDelay;
@@ -442,7 +447,6 @@
                             // If jitter buffer exceeds 500ms, force resync
                             if (avgJitterMs > 500 && video.buffered.length > 0) {
                                 console.warn('Jitter buffer too high (' + avgJitterMs + 'ms), forcing resync');
-                                // Re-request keyframe via PLI
                                 pc.getReceivers().forEach(r => {
                                     if (r.track && r.track.kind === 'video') {
                                         if (r.jitterBufferTarget !== undefined) r.jitterBufferTarget = 0;

@@ -1,0 +1,66 @@
+;
+; Streamio Virtual Display Driver (IddCx UMDF2)
+;
+; Creates virtual monitors on demand for VDI per-user displays.
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGuid   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Mfg%
+CatalogFile = streamio-display.cat
+DriverVer   = 03/20/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Mfg% = StreamioDisplay,NTamd64
+
+[StreamioDisplay.NTamd64]
+%DeviceName% = StreamioDisplay_Install, Root\StreamioDisplay
+
+[StreamioDisplay_Install]
+; UMDF driver — no .sys
+
+[StreamioDisplay_Install.HW]
+AddReg = StreamioDisplay_HW_AddReg
+
+[StreamioDisplay_HW_AddReg]
+; Mark as indirect display adapter
+HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+
+[StreamioDisplay_Install.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName   = %ServiceName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+[StreamioDisplay_Install.Wdf]
+UmdfService           = StreamioDisplay,StreamioDisplay_UmdfService
+UmdfServiceOrder      = StreamioDisplay
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfHostProcessSharing = ProcessSharingDisabled
+
+[StreamioDisplay_UmdfService]
+UmdfLibraryVersion = 2.33
+ServiceBinary      = %13%\streamio-display.dll
+UmdfExtensions     = IddCx0102
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+streamio-display.dll = 1
+
+[Strings]
+Mfg         = "Streamio"
+DeviceName  = "Streamio Virtual Display Adapter"
+ServiceName = "Streamio Virtual Display"
+DiskName    = "Streamio Virtual Display Installation Disk"

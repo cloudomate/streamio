@@ -1,5 +1,5 @@
 [workspace]
-members = ["backend", "gateway", "types"]
+members = ["backend", "gateway", "types", "service", "display-ctl"]
 resolver = "2"
 
 [profile.release]

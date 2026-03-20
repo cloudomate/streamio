@@ -1,0 +1,8 @@
+[package]
+name = "streamio-display-ctl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "display-ctl"
+path = "src/main.rs"

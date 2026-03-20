@@ -1,0 +1,73 @@
+;
+; streamio-vhid.inf - Installation file for the Streamio Virtual HID Driver
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = HIDClass
+ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider    = %ProviderName%
+CatalogFile = streamio-vhid.cat
+DriverVer   = 03/19/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+streamio-vhid.sys = 1
+
+; ---- Manufacturer ----
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = StreamioVhid_Install, Root\StreamioVHID
+
+; ---- Install Section ----
+
+[StreamioVhid_Install.NT]
+CopyFiles = StreamioVhid_CopyFiles
+
+[StreamioVhid_CopyFiles]
+streamio-vhid.sys
+
+[StreamioVhid_Install.NT.HW]
+AddReg = StreamioVhid_AddReg
+
+[StreamioVhid_AddReg]
+; Declare VHF (Vhf.sys) as a lower filter driver
+HKR,,"LowerFilters",0x00010000,"vhf"
+
+; ---- Service ----
+
+[StreamioVhid_Install.NT.Services]
+AddService = StreamioVhid, 0x00000002, StreamioVhid_Service
+
+[StreamioVhid_Service]
+DisplayName    = %ServiceName%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\streamio-vhid.sys
+
+; ---- WDF Co-Installer ----
+
+[StreamioVhid_Install.NT.Wdf]
+KmdfService = StreamioVhid, StreamioVhid_WdfSection
+
+[StreamioVhid_WdfSection]
+KmdfLibraryVersion = 1.33
+
+; ---- Strings ----
+
+[Strings]
+ProviderName     = "Streamio"
+ManufacturerName = "Streamio"
+DeviceName       = "Streamio Virtual HID Device"
+ServiceName      = "Streamio Virtual HID Driver"
+DiskName         = "Streamio Virtual HID Install Disk"

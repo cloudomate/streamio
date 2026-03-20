@@ -10,6 +10,40 @@ use gstreamer_webrtc as gst_webrtc;
 use streamio_types::SignalingMessage;
 use tokio::sync::mpsc;
 
+// Windows desktop detection FFI — must be at module level for #[link] to work
+#[cfg(target_os = "windows")]
+mod desktop_detect {
+    use std::ffi::c_void;
+    pub type HDESK = *mut c_void;
+    type BOOL = i32;
+    pub const DESKTOP_SWITCHDESKTOP: u32 = 0x0100;
+
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn OpenInputDesktop(flags: u32, inherit: BOOL, access: u32) -> HDESK;
+        pub fn CloseDesktop(desktop: HDESK) -> BOOL;
+        pub fn GetUserObjectInformationW(
+            obj: HDESK, index: i32, info: *mut u8, len: u32, needed: *mut u32,
+        ) -> BOOL;
+    }
+
+    pub fn desktop_name(hdesk: HDESK) -> String {
+        if hdesk.is_null() {
+            return "<null>".to_string();
+        }
+        let mut buf = [0u16; 256];
+        let mut needed = 0u32;
+        unsafe {
+            GetUserObjectInformationW(
+                hdesk, 2, buf.as_mut_ptr() as *mut u8,
+                (buf.len() * 2) as u32, &mut needed,
+            );
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+    }
+}
+
 /// Screen capture streamer using GStreamer WebRTC
 pub struct ScreenStreamer {
     pipeline: gst::Pipeline,
@@ -394,6 +428,11 @@ impl ScreenStreamer {
 
     fn create_encoder() -> Result<gst::Element> {
         // Try hardware encoders first, then fall back to software
+        // Log available encoders for debugging
+        for name in ["amfh264enc", "mfh264enc", "vtenc_h264", "x264enc"] {
+            let available = gst::ElementFactory::find(name).is_some();
+            tracing::info!("Encoder {}: {}", name, if available { "available" } else { "not found" });
+        }
 
         // macOS VideoToolbox
         if let Ok(enc) = gst::ElementFactory::make("vtenc_h264")
@@ -406,15 +445,27 @@ impl ScreenStreamer {
             return Ok(enc);
         }
 
+        // Windows: AMD AMF hardware encoder (direct GPU encode, lowest latency)
+        #[cfg(target_os = "windows")]
+        if let Ok(enc) = gst::ElementFactory::make("amfh264enc")
+            .property_from_str("usage", "ultra-low-latency")
+            .property("gop-size", 1i32)      // every frame is IDR
+            .property("bitrate", 15000u32)   // 15 Mbps
+            .property("max-bitrate", 20000u32)
+            .build()
+        {
+            tracing::info!("Using AMD AMF hardware encoder");
+            return Ok(enc);
+        }
+
         // Windows: Media Foundation H.264 encoder — available on all modern Windows systems.
-        // Automatically selects the best hardware encoder available (NVIDIA, AMD, Intel).
         // Works with system-memory frames from videoconvert upstream.
         #[cfg(target_os = "windows")]
         if let Ok(enc) = gst::ElementFactory::make("mfh264enc")
             .property("low-latency", true)
-            .property("gop-size", 1i32)      // every frame is IDR — zero encoder buffering
-            .property("bitrate", 15000u32)   // 15 Mbps (higher for all-IDR)
-            .property("max-bitrate", 20000u32)
+            .property("gop-size", 60i32)     // keyframe every 2s at 30fps — much better compression
+            .property("bitrate", 8000u32)    // 8 Mbps (sufficient with P-frames)
+            .property("max-bitrate", 15000u32)
             .build()
         {
             tracing::info!("Using Windows Media Foundation H.264 encoder (all-IDR mode)");
@@ -469,6 +520,105 @@ impl ScreenStreamer {
             .map_err(|_| anyhow::anyhow!("Failed to start pipeline"))?;
         tracing::info!("Screen capture pipeline started");
         Ok(())
+    }
+
+    /// Watch the GStreamer bus for errors/EOS.
+    /// On Windows, also detects desktop switches (lock/unlock/credentials)
+    /// that invalidate the capture surface.
+    /// Returns a oneshot receiver that fires when the pipeline should be restarted.
+    pub fn watch_for_errors(&self) -> tokio::sync::oneshot::Receiver<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let bus = self.pipeline.bus().expect("Pipeline has no bus");
+
+        std::thread::spawn(move || {
+            Self::bus_watch_loop(bus, tx);
+        });
+
+        rx
+    }
+
+    #[cfg(target_os = "windows")]
+    fn bus_watch_loop(bus: gst::Bus, tx: tokio::sync::oneshot::Sender<String>) {
+        use desktop_detect::*;
+
+        let hdesk = unsafe { OpenInputDesktop(0, 0, DESKTOP_SWITCHDESKTOP) };
+        let initial_desktop = desktop_name(hdesk);
+        if !hdesk.is_null() { unsafe { CloseDesktop(hdesk); } }
+        tracing::info!("Desktop switch detector active, initial: {:?}", initial_desktop);
+
+        loop {
+            let timeout = gst::ClockTime::from_mseconds(500);
+            match bus.timed_pop(Some(timeout)) {
+                Some(msg) => match msg.view() {
+                    gst::MessageView::Error(err) => {
+                        let reason = format!(
+                            "Pipeline error: {} ({})",
+                            err.error(),
+                            err.debug().unwrap_or_default()
+                        );
+                        tracing::error!("{}", reason);
+                        let _ = tx.send(reason);
+                        return;
+                    }
+                    gst::MessageView::Eos(_) => {
+                        tracing::warn!("Pipeline EOS");
+                        let _ = tx.send("Pipeline EOS".to_string());
+                        return;
+                    }
+                    _ => {}
+                },
+                None => {
+                    // Check for desktop switch
+                    let hdesk = unsafe { OpenInputDesktop(0, 0, DESKTOP_SWITCHDESKTOP) };
+                    if hdesk.is_null() {
+                        // Can't open desktop (e.g. on lock screen) — skip, don't treat as change
+                        continue;
+                    }
+                    let current = desktop_name(hdesk);
+                    unsafe { CloseDesktop(hdesk); }
+
+                    // Only trigger on real named desktop changes (ignore null/empty)
+                    if !current.is_empty()
+                        && current != initial_desktop
+                        && initial_desktop != "<null>"
+                    {
+                        // Wait for desktop to stabilize (lock/unlock transitions rapidly)
+                        tracing::info!("Desktop change: {:?} -> {:?}, stabilizing...", initial_desktop, current);
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        let msg = format!(
+                            "Desktop switch: {} -> {}", initial_desktop, current
+                        );
+                        tracing::warn!("{}, restarting capture", msg);
+                        let _ = tx.send(msg);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn bus_watch_loop(bus: gst::Bus, tx: tokio::sync::oneshot::Sender<String>) {
+        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            match msg.view() {
+                gst::MessageView::Error(err) => {
+                    let reason = format!(
+                        "Pipeline error: {} ({})",
+                        err.error(),
+                        err.debug().unwrap_or_default()
+                    );
+                    tracing::error!("{}", reason);
+                    let _ = tx.send(reason);
+                    return;
+                }
+                gst::MessageView::Eos(_) => {
+                    tracing::warn!("Pipeline EOS");
+                    let _ = tx.send("Pipeline EOS".to_string());
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Create and send an SDP offer

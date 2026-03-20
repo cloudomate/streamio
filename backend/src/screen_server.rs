@@ -171,33 +171,49 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
         streamer_offer.create_offer();
     });
 
+    // Watch for pipeline errors/EOS (e.g., screen lock kills capture)
+    let mut pipeline_dead = streamer.watch_for_errors();
+
     let input_tx = start_input_thread();
     let streamer_msg = streamer.clone();
 
-    while let Some(msg) = ws_rx.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if let Ok(sig_msg) = serde_json::from_str::<SignalingMessage>(&text) {
-                    if let Err(e) = streamer_msg.handle_signaling(sig_msg) {
-                        error!("Signaling error: {}", e);
+    loop {
+        tokio::select! {
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(sig_msg) = serde_json::from_str::<SignalingMessage>(&text) {
+                            if let Err(e) = streamer_msg.handle_signaling(sig_msg) {
+                                error!("Signaling error: {}", e);
+                            }
+                            continue;
+                        }
+                        if let Ok(input_event) = serde_json::from_str::<InputEvent>(&text) {
+                            let _ = input_tx.send(input_event);
+                            continue;
+                        }
+                        warn!("Unknown message: {}", text);
                     }
-                    continue;
+                    Some(Ok(Message::Close(_))) => {
+                        info!("WebSocket closed by client");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        error!("WebSocket error: {}", e);
+                        break;
+                    }
+                    None => {
+                        info!("WebSocket stream ended");
+                        break;
+                    }
+                    _ => {}
                 }
-                if let Ok(input_event) = serde_json::from_str::<InputEvent>(&text) {
-                    let _ = input_tx.send(input_event);
-                    continue;
-                }
-                warn!("Unknown message: {}", text);
             }
-            Ok(Message::Close(_)) => {
-                info!("WebSocket closed by client");
+            reason = &mut pipeline_dead => {
+                let reason = reason.unwrap_or_else(|_| "unknown".to_string());
+                warn!("Pipeline died ({}), closing WebSocket for client reconnect", reason);
                 break;
             }
-            Err(e) => {
-                error!("WebSocket error: {}", e);
-                break;
-            }
-            _ => {}
         }
     }
 
