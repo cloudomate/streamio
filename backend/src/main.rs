@@ -56,16 +56,63 @@ fn setup_bundled_gstreamer() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Early diagnostic: dump environment to a file so we can debug headless launches
+    {
+        let pid = std::process::id();
+        let diag_path = format!(r"C:\build\backend-diag-{}.txt", pid);
+        let mut diag = String::new();
+        diag.push_str(&format!("PID: {}\n", pid));
+        diag.push_str(&format!("EXE: {:?}\n", std::env::current_exe()));
+        diag.push_str(&format!("CWD: {:?}\n", std::env::current_dir()));
+        for (k, v) in std::env::vars() {
+            diag.push_str(&format!("{}={}\n", k, v));
+        }
+        // Try multiple locations
+        if std::fs::write(&diag_path, &diag).is_err() {
+            let alt = format!(r"C:\Users\Public\backend-diag-{}.txt", pid);
+            if std::fs::write(&alt, &diag).is_err() {
+                let temp = format!(r"C:\Windows\Temp\backend-diag-{}.txt", pid);
+                let _ = std::fs::write(&temp, &diag);
+            }
+        }
+    }
+
+    // Write panics to a file when running headless (launched by session manager)
+    if let Ok(log_path) = std::env::var("STREAMIO_LOG_FILE") {
+        let panic_path = log_path.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            let msg = format!("BACKEND PANIC: {}\n", info);
+            let _ = std::fs::write(&panic_path, &msg);
+        }));
+    }
+
     // Set up bundled GStreamer if present (must be before gstreamer::init)
     setup_bundled_gstreamer();
 
-    // Initialize logging
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Initialize logging — write to file if STREAMIO_LOG_FILE is set (e.g. session manager launch)
+    let env_filter = tracing_subscriber::EnvFilter::new(
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+    );
+    if let Ok(log_path) = std::env::var("STREAMIO_LOG_FILE") {
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("Failed to open log file");
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(log_file))
+                    .with_ansi(false),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     // Initialize GStreamer
     gstreamer::init()?;

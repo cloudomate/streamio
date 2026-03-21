@@ -31,6 +31,8 @@ AddReg = StreamioDisplay_HW_AddReg
 [StreamioDisplay_HW_AddReg]
 ; Mark as indirect display adapter
 HKR,,"UpperFilters",0x00010000,"IndirectKmd"
+; Allow all users read/write to device interface (for display-ctl)
+HKR,,"Security",,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
 
 [StreamioDisplay_Install.Services]
 AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall

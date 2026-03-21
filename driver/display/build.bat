@@ -61,6 +61,7 @@ echo [2/2] Linking streamio-display.dll ...
     d3d11.lib dxgi.lib ^
     onecoreuap.lib ^
     ntdll.lib ^
+    ole32.lib advapi32.lib ^
     ucrt.lib vcruntime.lib msvcrt.lib
 if errorlevel 1 (
     echo LINK FAILED

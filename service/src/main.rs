@@ -393,6 +393,16 @@ fn run_pipe_server() {
             }
         }
 
+        fn reset(&mut self) {
+            // Release all buttons and keys when client disconnects/reconnects
+            self.buttons = 0;
+            self.send_mouse_report(0, 0, 0);
+            self.modifiers = 0;
+            self.pressed_keys.clear();
+            self.send_keyboard_report();
+            svc_log("Reset input state (all buttons/keys released)");
+        }
+
         fn send_keyboard_report(&self) {
             let mut report = VhidKeyboardReport {
                 report_id: 1,
@@ -609,6 +619,7 @@ fn run_pipe_server() {
             }
 
             svc_log("Client connected!");
+            state.reset();
 
             let mut len_buf = [0u8; 4];
             let mut read = 0u32;

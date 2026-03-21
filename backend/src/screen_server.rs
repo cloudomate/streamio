@@ -6,7 +6,7 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
     },
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
@@ -23,11 +23,13 @@ use std::{
     },
 };
 use streamio_types::{InputEvent, SessionClaims, SignalingMessage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 /// Start input handling thread and return sender.
+/// Input events are forwarded as-is to the input pipe.
+/// Coordinate translation is handled by the session manager (if present).
 fn start_input_thread() -> mpsc::UnboundedSender<InputEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel::<InputEvent>();
     std::thread::spawn(move || {
@@ -45,6 +47,11 @@ pub struct AppState {
     pub fps: u32,
     pub token_secret: String,
     pub active_sessions: Arc<AtomicU32>,
+    /// Hold previous pipeline alive so DXGI output stays enumerable for the next one.
+    /// On virtual displays, d3d11screencapturesrc's DXGI output handle disappears
+    /// once the pipeline that opened it is destroyed. We keep the old pipeline alive
+    /// until the new one has successfully started and acquired its own DXGI handle.
+    pub prev_streamer: Arc<Mutex<Option<Arc<ScreenStreamer>>>>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +71,7 @@ pub async fn run_server(fps: u32, port: u16) -> Result<()> {
         fps,
         token_secret,
         active_sessions: Arc::new(AtomicU32::new(0)),
+        prev_streamer: Arc::new(Mutex::new(None)),
     });
 
     // CORS: restrict to gateway origin if configured, else permissive (dev mode)
@@ -87,7 +95,14 @@ pub async fn run_server(fps: u32, port: u16) -> Result<()> {
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     info!("Backend listening on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Use SO_REUSEADDR to allow binding even if a previous process left orphaned sockets
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(socket.into())?;
+
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -124,34 +139,78 @@ fn verify_token(headers: &HeaderMap, secret: &str) -> bool {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     if !verify_token(&headers, &state.token_secret) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    ws.on_upgrade(move |socket| handle_websocket(socket, state))
+    let display_index: Option<i32> = params.get("display").and_then(|s| s.parse().ok());
+    ws.on_upgrade(move |socket| handle_websocket(socket, state, display_index))
 }
 
-async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, display_index: Option<i32>) {
     state.active_sessions.fetch_add(1, Ordering::Relaxed);
-    info!("New WebSocket connection");
+    info!("New WebSocket connection (display={:?})", display_index);
 
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (sig_tx, mut sig_rx) = mpsc::unbounded_channel::<SignalingMessage>();
 
-    let streamer = match ScreenStreamer::new(state.fps, sig_tx) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!("Failed to create screen streamer: {}", e);
-            state.active_sessions.fetch_sub(1, Ordering::Relaxed);
-            return;
+    // Create new pipeline while the previous one is still alive (holds DXGI output open).
+    // Retry because DXGI enumeration of virtual displays can take a moment to stabilize
+    // even when the old pipeline is keeping the output alive.
+    let (streamer, mut sig_rx) = {
+        const MAX_RETRIES: u32 = 6;
+        const RETRY_DELAY_MS: u64 = 500;
+        let mut last_err = String::new();
+        let mut result = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            let (sig_tx, sig_rx_inner) = mpsc::unbounded_channel::<SignalingMessage>();
+            match ScreenStreamer::new(state.fps, sig_tx, display_index) {
+                Ok(s) => {
+                    let s = Arc::new(s);
+                    match s.start() {
+                        Ok(()) => {
+                            if attempt > 1 {
+                                info!("Pipeline started on attempt {}", attempt);
+                            }
+                            result = Some((s, sig_rx_inner));
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = format!("start failed: {}", e);
+                            warn!("Pipeline attempt {}/{}: {}", attempt, MAX_RETRIES, last_err);
+                            let _ = s.stop();
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("create failed: {}", e);
+                    warn!("Pipeline attempt {}/{}: {}", attempt, MAX_RETRIES, last_err);
+                }
+            }
+            if attempt < MAX_RETRIES {
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+        }
+
+        match result {
+            Some(r) => r,
+            None => {
+                error!("Failed to start pipeline after {} attempts: {}", MAX_RETRIES, last_err);
+                state.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
         }
     };
 
-    if let Err(e) = streamer.start() {
-        error!("Failed to start pipeline: {}", e);
-        state.active_sessions.fetch_sub(1, Ordering::Relaxed);
-        return;
+    // New pipeline started successfully — now we can drop the previous one.
+    {
+        let mut prev = state.prev_streamer.lock().await;
+        if let Some(old) = prev.take() {
+            info!("Dropping previous pipeline (DXGI handover complete)");
+            let _ = old.stop();
+        }
     }
 
     // Forward outgoing signaling to WebSocket
@@ -218,8 +277,14 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     ws_forward_task.abort();
-    if let Err(e) = streamer.stop() {
-        error!("Failed to stop streamer: {}", e);
+
+    // Don't stop the pipeline — keep it alive so the next connection can
+    // create a new d3d11screencapturesrc while DXGI output is still held open.
+    // Store in prev_streamer; it will be dropped when the next pipeline starts.
+    {
+        let mut prev = state.prev_streamer.lock().await;
+        info!("Preserving pipeline for DXGI handover to next connection");
+        *prev = Some(streamer);
     }
 
     state.active_sessions.fetch_sub(1, Ordering::Relaxed);

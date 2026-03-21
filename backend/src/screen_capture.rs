@@ -52,22 +52,24 @@ pub struct ScreenStreamer {
 }
 
 impl ScreenStreamer {
-    /// Create a new screen capture streamer
+    /// Create a new screen capture streamer.
+    /// `display_index` selects which monitor to capture (None = use DISPLAY_INDEX env var or 0).
     pub fn new(
         fps: u32,
         outgoing_tx: mpsc::UnboundedSender<SignalingMessage>,
+        display_index: Option<i32>,
     ) -> Result<Self> {
         let pipeline = gst::Pipeline::new();
 
         // Screen capture source - platform specific
         #[cfg(target_os = "macos")]
-        let capture_src = Self::create_macos_capture(fps)?;
+        let capture_src = Self::create_macos_capture(fps, display_index)?;
 
         #[cfg(target_os = "linux")]
         let capture_src = Self::create_linux_capture(fps)?;
 
         #[cfg(target_os = "windows")]
-        let capture_src = Self::create_windows_capture(fps)?;
+        let capture_src = Self::create_windows_capture(fps, display_index)?;
 
         // Video processing: convert colorspace, encode to H.264
         let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
@@ -173,15 +175,17 @@ impl ScreenStreamer {
     }
 
     #[cfg(target_os = "macos")]
-    fn create_macos_capture(_fps: u32) -> Result<gst::Element> {
+    fn create_macos_capture(_fps: u32, display_override: Option<i32>) -> Result<gst::Element> {
         // avfvideosrc captures screen on macOS
         // capture-screen=true captures the display instead of camera
         // do-timestamp=true is critical for live sources
         // device-index selects which display (0=main, 1=secondary, etc.)
-        let display_index: i32 = std::env::var("DISPLAY_INDEX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let display_index: i32 = display_override.unwrap_or_else(|| {
+            std::env::var("DISPLAY_INDEX")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        });
 
         let src = gst::ElementFactory::make("avfvideosrc")
             .property("capture-screen", true)
@@ -223,17 +227,19 @@ impl ScreenStreamer {
     }
 
     #[cfg(target_os = "windows")]
-    fn create_windows_capture(_fps: u32) -> Result<gst::Element> {
-        let monitor_index: i32 = std::env::var("DISPLAY_INDEX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+    fn create_windows_capture(_fps: u32, display_override: Option<i32>) -> Result<gst::Element> {
+        let monitor_index: i32 = display_override.unwrap_or_else(|| {
+            std::env::var("DISPLAY_INDEX")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        });
 
         // Windows Graphics Capture API: captures at the compositor level, works on
         // multi-GPU laptops (NVIDIA + AMD iGPU) where DXGI Desktop Duplication fails
         // because it requires running on the adapter that owns the display output.
         if let Ok(src) = gst::ElementFactory::make("d3d11screencapturesrc")
-            .property("show-cursor", false)
+            .property("show-cursor", true)
             .property("do-timestamp", true)
             .property("monitor-index", monitor_index)
             .property_from_str("capture-api", "wgc")
@@ -245,7 +251,7 @@ impl ScreenStreamer {
 
         // Fallback: DXGI Desktop Duplication
         if let Ok(src) = gst::ElementFactory::make("d3d11screencapturesrc")
-            .property("show-cursor", false)
+            .property("show-cursor", true)
             .property("do-timestamp", true)
             .property("monitor-index", monitor_index)
             .build()
@@ -516,10 +522,26 @@ impl ScreenStreamer {
 
     /// Start the pipeline
     pub fn start(&self) -> Result<()> {
-        self.pipeline.set_state(gst::State::Playing)
-            .map_err(|_| anyhow::anyhow!("Failed to start pipeline"))?;
-        tracing::info!("Screen capture pipeline started");
-        Ok(())
+        match self.pipeline.set_state(gst::State::Playing) {
+            Ok(_) => {
+                tracing::info!("Screen capture pipeline started");
+                Ok(())
+            }
+            Err(e) => {
+                // Try to get a more detailed error from the bus
+                let bus = self.pipeline.bus().unwrap();
+                if let Some(msg) = bus.timed_pop_filtered(
+                    gst::ClockTime::from_mseconds(100),
+                    &[gst::MessageType::Error],
+                ) {
+                    if let gst::MessageView::Error(err) = msg.view() {
+                        tracing::error!("Pipeline error: {:?} (debug: {:?})", err.error(), err.debug());
+                        anyhow::bail!("Failed to start pipeline: {:?}", err.error());
+                    }
+                }
+                anyhow::bail!("Failed to start pipeline: {:?}", e)
+            }
+        }
     }
 
     /// Watch the GStreamer bus for errors/EOS.

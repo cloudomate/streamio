@@ -1,34 +1,66 @@
-//! Input injection for remote control using enigo
+//! Input forwarding for remote control.
 //!
-//! Cross-platform mouse and keyboard input simulation.
-//! On Windows, when a lock-screen service is available, input commands
-//! are forwarded to it via named pipe so they reach the Winlogon desktop.
+//! On Windows with a session manager, input events are forwarded to
+//! a per-session named pipe: `\\.\pipe\streamio-input-<session_id>`.
+//! The session manager handles coordinate translation and VHID injection.
+//!
+//! Falls back to enigo (direct injection) on non-Windows or when no
+//! session pipe is available (standalone/dev mode).
 
-use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use std::sync::Mutex;
 use streamio_types::InputEvent;
 
-/// Input controller using enigo
+/// Input controller — routes events to the appropriate injection path.
 pub struct InputController {
-    enigo: Mutex<Enigo>,
+    /// Per-session pipe (Windows with session manager)
+    #[cfg(target_os = "windows")]
+    pipe: Mutex<PipeState>,
+    /// Fallback direct injection (non-Windows or dev mode)
+    #[cfg(not(target_os = "windows"))]
+    enigo: Mutex<enigo::Enigo>,
+}
+
+#[cfg(target_os = "windows")]
+enum PipeState {
+    /// Connected to session manager pipe
+    Connected(std::fs::File),
+    /// Using legacy shared pipe (streamio-service)
+    Legacy(std::fs::File),
+    /// Not connected yet
+    Disconnected {
+        session_id: Option<String>,
+    },
 }
 
 impl InputController {
     pub fn new() -> Self {
         #[cfg(target_os = "windows")]
-        Self::set_dpi_aware();
+        {
+            Self::set_dpi_aware();
 
-        #[cfg(target_os = "windows")]
-        Self::spawn_input_helper();
+            let session_id = std::env::var("SESSION_ID").ok();
 
-        let enigo = Enigo::new(&Settings::default()).expect("Failed to create Enigo");
+            // If no SESSION_ID, try to spawn the legacy service helper
+            if session_id.is_none() {
+                Self::spawn_input_helper();
+            }
 
-        Self {
-            enigo: Mutex::new(enigo),
+            Self {
+                pipe: Mutex::new(PipeState::Disconnected { session_id }),
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let enigo = enigo::Enigo::new(&enigo::Settings::default())
+                .expect("Failed to create Enigo");
+            Self {
+                enigo: Mutex::new(enigo),
+            }
         }
     }
 
-    /// Spawn the uiAccess input helper if it exists next to the exe or in Program Files.
+    /// Spawn the legacy input helper (when not using session manager).
     #[cfg(target_os = "windows")]
     fn spawn_input_helper() {
         use std::os::windows::process::CommandExt;
@@ -37,11 +69,9 @@ impl InputController {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
         let candidates = [
-            // Next to this exe
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.join("streamio-service.exe"))),
-            // Program Files install location
             Some(std::path::PathBuf::from(
                 r"C:\Program Files\Streamio\streamio-service.exe",
             )),
@@ -58,7 +88,7 @@ impl InputController {
                 {
                     Ok(child) => {
                         tracing::info!(
-                            "Spawned input helper: {} (pid={})",
+                            "Spawned legacy input helper: {} (pid={})",
                             candidate.display(),
                             child.id()
                         );
@@ -74,7 +104,7 @@ impl InputController {
                 }
             }
         }
-        tracing::info!("Input helper not found — lock screen input will not be available");
+        tracing::info!("No input helper found — lock screen input unavailable in dev mode");
     }
 
     #[cfg(target_os = "windows")]
@@ -90,7 +120,8 @@ impl InputController {
         }
 
         unsafe {
-            let result = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let result =
+                SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             if result != 0 {
                 tracing::info!("Set DPI awareness to per-monitor-v2");
             } else {
@@ -100,15 +131,90 @@ impl InputController {
     }
 
     pub fn handle_event(&self, event: &InputEvent) {
-        // On Windows, use VHF driver exclusively (works on lock screen too).
-        // Enigo causes duplicate input since both paths inject simultaneously.
         #[cfg(target_os = "windows")]
         {
-            let _ = lock_service::try_send(event);
+            self.send_to_pipe(event);
             return;
         }
 
         #[cfg(not(target_os = "windows"))]
+        {
+            self.handle_event_enigo(event);
+        }
+    }
+
+    /// Send event to the appropriate named pipe (session or legacy).
+    #[cfg(target_os = "windows")]
+    fn send_to_pipe(&self, event: &InputEvent) {
+        use std::io::Write;
+
+        let json = match serde_json::to_vec(event) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+
+        let mut guard = match self.pipe.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        // Try to write on existing connection
+        match &mut *guard {
+            PipeState::Connected(ref mut pipe) | PipeState::Legacy(ref mut pipe) => {
+                let len = (json.len() as u32).to_le_bytes();
+                if pipe.write_all(&len).is_ok()
+                    && pipe.write_all(&json).is_ok()
+                    && pipe.flush().is_ok()
+                {
+                    return;
+                }
+                // Connection broken — fall through to reconnect
+                tracing::warn!("Input pipe broken, reconnecting");
+            }
+            PipeState::Disconnected { .. } => {}
+        }
+
+        // Extract session_id before replacing state
+        let session_id = match &*guard {
+            PipeState::Disconnected { session_id } => session_id.clone(),
+            _ => std::env::var("SESSION_ID").ok(),
+        };
+
+        // Try to connect
+        let pipe_name = if let Some(ref sid) = session_id {
+            format!(r"\\.\pipe\streamio-input-{}", sid)
+        } else {
+            r"\\.\pipe\streamio-input".to_string()
+        };
+
+        match std::fs::OpenOptions::new().write(true).open(&pipe_name) {
+            Ok(mut pipe) => {
+                let len = (json.len() as u32).to_le_bytes();
+                if pipe.write_all(&len).is_ok()
+                    && pipe.write_all(&json).is_ok()
+                    && pipe.flush().is_ok()
+                {
+                    tracing::info!("Connected to input pipe: {}", pipe_name);
+                    if session_id.is_some() {
+                        *guard = PipeState::Connected(pipe);
+                    } else {
+                        *guard = PipeState::Legacy(pipe);
+                    }
+                    return;
+                }
+            }
+            Err(_e) => {
+                // Silently retry next event — avoid log spam
+            }
+        }
+
+        *guard = PipeState::Disconnected { session_id };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn handle_event_enigo(&self, event: &InputEvent) {
+        use enigo::{Button, Coordinate, Direction, Keyboard, Mouse};
+
         match event {
             InputEvent::MouseMove { x, y } => {
                 let mut enigo = self.enigo.lock().unwrap();
@@ -143,13 +249,21 @@ impl InputController {
                     let _ = enigo.scroll(amount, enigo::Axis::Vertical);
                 }
             }
-            InputEvent::KeyDown { key, code: _, modifiers: _ } => {
+            InputEvent::KeyDown {
+                key,
+                code: _,
+                modifiers: _,
+            } => {
                 if let Some(k) = map_key(key) {
                     let mut enigo = self.enigo.lock().unwrap();
                     let _ = enigo.key(k, Direction::Press);
                 }
             }
-            InputEvent::KeyUp { key, code: _, modifiers: _ } => {
+            InputEvent::KeyUp {
+                key,
+                code: _,
+                modifiers: _,
+            } => {
                 if let Some(k) = map_key(key) {
                     let mut enigo = self.enigo.lock().unwrap();
                     let _ = enigo.key(k, Direction::Release);
@@ -159,6 +273,7 @@ impl InputController {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn map_key(key: &str) -> Option<enigo::Key> {
     match key {
         "Shift" => Some(enigo::Key::Shift),
@@ -200,94 +315,5 @@ fn map_key(key: &str) -> Option<enigo::Key> {
             Some(enigo::Key::Unicode(c))
         }
         _ => None,
-    }
-}
-
-/// Named-pipe client for the lock-screen input service.
-/// The service runs as SYSTEM and can inject input on the Winlogon desktop.
-/// Pipe name: \\.\pipe\streamio-input
-#[cfg(target_os = "windows")]
-mod lock_service {
-    use streamio_types::InputEvent;
-    use std::io::Write;
-    use std::sync::Mutex;
-
-    static PIPE: Mutex<Option<std::fs::File>> = Mutex::new(None);
-    static BACKOFF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    fn now_secs() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-
-    /// Try to send an input event to the lock-screen service.
-    /// Returns true if sent successfully, false if pipe not available.
-    pub fn try_send(event: &InputEvent) -> bool {
-        use std::sync::atomic::Ordering;
-
-        // Backoff check (avoid reconnect spam)
-        if now_secs() < BACKOFF_UNTIL.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        let json = match serde_json::to_vec(event) {
-            Ok(j) => j,
-            Err(_) => return false,
-        };
-
-        let mut guard = match PIPE.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-
-        // Try to write on existing connection
-        if let Some(ref mut pipe) = *guard {
-            let len = (json.len() as u32).to_le_bytes();
-            if pipe.write_all(&len).is_ok()
-                && pipe.write_all(&json).is_ok()
-                && pipe.flush().is_ok()
-            {
-                return true;
-            }
-            // Connection broken, drop it
-            tracing::warn!("Pipe connection broken, reconnecting");
-            *guard = None;
-        }
-
-        // Try to open a new connection
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .open(r"\\.\pipe\streamio-input")
-        {
-            Ok(mut pipe) => {
-                let len = (json.len() as u32).to_le_bytes();
-                if pipe.write_all(&len).is_ok()
-                    && pipe.write_all(&json).is_ok()
-                    && pipe.flush().is_ok()
-                {
-                    static CONNECT_LOG: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !CONNECT_LOG.swap(true, Ordering::Relaxed) {
-                        tracing::info!("Connected to input service pipe");
-                    }
-                    *guard = Some(pipe);
-                    return true;
-                }
-                tracing::warn!("Pipe write failed after connect");
-                false
-            }
-            Err(e) => {
-                static ERR_LOG: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !ERR_LOG.swap(true, Ordering::Relaxed) {
-                    tracing::warn!("Input service pipe not available: {}", e);
-                }
-                // Back off for 5 seconds
-                BACKOFF_UNTIL.store(now_secs() + 5, Ordering::Relaxed);
-                false
-            }
-        }
     }
 }

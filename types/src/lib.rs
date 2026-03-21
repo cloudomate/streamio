@@ -137,6 +137,39 @@ pub struct ShadowRequest {
     pub role: Role,
 }
 
+// ── Session Manager types ───────────────────────────────────────────────────
+
+/// Request to create a new VDI session for a user.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionRequest {
+    pub user_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+}
+
+/// Response from session creation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionResponse {
+    pub session_id: String,
+    pub backend_port: u16,
+    pub display_index: u32,
+    pub windows_user: String,
+}
+
+/// Status of an active session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub user_id: String,
+    pub windows_user: String,
+    pub display_index: u32,
+    pub display_rect: (i32, i32, u32, u32),
+    pub backend_port: u16,
+    pub backend_pid: Option<u32>,
+    pub created_at: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserAssignment {
     pub user_sub: String,

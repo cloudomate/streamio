@@ -49,14 +49,14 @@
             background: #000;
             position: relative;
             overflow: hidden;
-            cursor: default;
+            cursor: none;
         }
         #video {
             max-width: 100%;
             max-height: 100%;
             object-fit: contain;
             background: #000;
-            cursor: default;
+            cursor: none;
         }
         .controls {
             background: #161b22;
@@ -131,7 +131,11 @@
             if (ws) { ws.close(); ws = null; }
 
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+            // Forward ?display=N query param to WebSocket URL
+            const urlParams = new URLSearchParams(location.search);
+            const displayParam = urlParams.get('display');
+            const wsQuery = displayParam ? `?display=${displayParam}` : '';
+            ws = new WebSocket(`${protocol}//${location.host}/ws${wsQuery}`);
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
