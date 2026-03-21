@@ -1,8 +1,8 @@
 //! REST API for gateway integration.
 //!
 //! Endpoints:
-//!   POST   /api/sessions          — Create a session (display + account + backend)
-//!   DELETE /api/sessions/:id      — Destroy a session
+//!   POST   /api/sessions          — Create or reuse a session (display + account + backend)
+//!   DELETE /api/sessions/:id      — Mark session inactive (backend+display kept alive)
 //!   GET    /api/sessions          — List active sessions
 //!   GET    /api/sessions/:id      — Get session details
 
@@ -42,65 +42,161 @@ async fn create_session(
     Json(req): Json<SessionRequest>,
 ) -> impl IntoResponse {
     info!(
-        "Creating session for user {} ({}x{}@{}Hz)",
+        "Session request for user {} ({}x{}@{}Hz)",
         req.user_id, req.width, req.height, req.refresh_hz
     );
 
-    // 1. Create or get local Windows account
+    // ── Check if this user already has a session (reuse it) ──
+    {
+        let sessions = state.sm.sessions.read().await;
+        if let Some(existing) = sessions.values().find(|s| s.user_id == req.user_id) {
+            info!(
+                "Reusing existing session {} for user {} (port={}, display={})",
+                existing.session_id, req.user_id, existing.backend_port, existing.display_index
+            );
+
+            // Check if backend is still alive
+            let backend_alive = if let Some(pid) = existing.backend_pid {
+                is_process_alive(pid)
+            } else {
+                false
+            };
+
+            if backend_alive {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!(SessionResponse {
+                        session_id: existing.session_id.clone(),
+                        backend_port: existing.backend_port,
+                        display_index: existing.display_index,
+                        os_user: existing.os_user.clone(),
+                    })),
+                )
+                    .into_response();
+            } else {
+                warn!("Existing session {} has dead backend, will recreate backend only",
+                      existing.session_id);
+                // Backend died but display is still there — just relaunch backend
+                let session_id = existing.session_id.clone();
+                let port = existing.backend_port;
+                let monitor_index = existing.display_index;
+                let os_user = existing.os_user.clone();
+                drop(sessions); // release read lock
+
+                // Get account info
+                let account = match crate::accounts::create_or_get_account(&req.user_id) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        error!("Failed to get account: {}", e);
+                        return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("Account error: {}", e)})))
+                            .into_response();
+                    }
+                };
+
+                let backend_pid = match crate::launcher::launch_backend(
+                    &state.sm.backend_path, &account.username, &account.password,
+                    port, monitor_index, &session_id,
+                    &state.sm.token_secret, &state.sm.gateway_url,
+                ) {
+                    Ok(proc) => {
+                        let pid = proc.pid;
+                        std::mem::forget(proc);
+                        Some(pid)
+                    }
+                    Err(e) => {
+                        error!("Failed to relaunch backend: {}", e);
+                        return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": format!("Backend relaunch failed: {}", e)})))
+                            .into_response();
+                    }
+                };
+
+                // Update session with new PID
+                {
+                    let mut sessions = state.sm.sessions.write().await;
+                    if let Some(s) = sessions.get_mut(&session_id) {
+                        s.backend_pid = backend_pid;
+                    }
+                }
+                state.sm.persist_state().await;
+
+                info!("Backend relaunched for session {} (pid={:?})", session_id, backend_pid);
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!(SessionResponse {
+                        session_id,
+                        backend_port: port,
+                        display_index: monitor_index,
+                        os_user,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // ── No existing session — create everything from scratch ──
+    info!("Creating new session for user {}", req.user_id);
+
+    // 1. Create or get local OS account
     let account = match crate::accounts::create_or_get_account(&req.user_id) {
         Ok(a) => a,
         Err(e) => {
             error!("Failed to create account: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Account creation failed: {}", e)})),
-            )
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Account creation failed: {}", e)})))
                 .into_response();
         }
     };
 
-    // 2. Create virtual display
-    let display_id = match crate::display::create_display(
-        &state.sm.display_ctl_path,
-        req.width,
-        req.height,
-        req.refresh_hz,
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            error!("Failed to create display: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Display creation failed: {}", e)})),
-            )
-                .into_response();
+    // 2. Determine display for this user.
+    // Count current sessions to decide: first user gets the physical display (0),
+    // additional users get virtual displays.
+    let current_session_count = state.sm.sessions.read().await.len();
+
+    let (display_id, monitor_index, display_rect) = if current_session_count == 0 {
+        // First user: use physical display 0 — no virtual display needed
+        info!("First user — using physical display 0");
+        let displays = crate::display::enumerate_displays();
+        let primary = displays.first();
+        let rect = primary
+            .map(|d| (d.x, d.y, d.width, d.height))
+            .unwrap_or((0, 0, req.width, req.height));
+        (0u32, 0u32, rect)
+    } else {
+        // Additional users: create virtual display
+        let did = match crate::display::create_display(
+            &state.sm.display_ctl_path, req.width, req.height, req.refresh_hz,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to create display: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Display creation failed: {}", e)})))
+                    .into_response();
+            }
+        };
+
+        if let Err(e) = crate::display::extend_desktop() {
+            warn!("Failed to extend desktop: {}", e);
         }
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let displays = crate::display::enumerate_displays();
+        let new_display = displays.last();
+        let rect = new_display
+            .map(|d| (d.x, d.y, d.width, d.height))
+            .unwrap_or((0, 0, req.width, req.height));
+        let midx = new_display.map(|d| d.index).unwrap_or(did);
+        (did, midx, rect)
     };
-
-    // 3. Extend desktop to include new display
-    if let Err(e) = crate::display::extend_desktop() {
-        warn!("Failed to extend desktop (may already be extended): {}", e);
-    }
-
-    // Wait briefly for Windows to settle the display topology
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-    // 4. Query actual display rectangle from EnumDisplayMonitors
-    // The new virtual display should be the last one enumerated
-    let displays = crate::display::enumerate_displays();
-    let new_display = displays.last();
-    let display_rect = new_display
-        .map(|d| (d.x, d.y, d.width, d.height))
-        .unwrap_or((0, 0, req.width, req.height));
-    // Use the Windows monitor enumeration index (not the IddCx driver index)
-    // so the backend captures the correct monitor. Display 0 is the physical display.
-    let monitor_index = new_display.map(|d| d.index).unwrap_or(display_id);
-    // TODO: remove this debug override
-    info!("DEBUG: enumerated {} displays, monitor_index={}", displays.len(), monitor_index);
 
     info!(
         "Display {} (monitor_index={}) rect: ({}, {}, {}x{})",
-        display_id, monitor_index, display_rect.0, display_rect.1, display_rect.2, display_rect.3
+        display_id, monitor_index, display_rect.0, display_rect.1,
+        display_rect.2, display_rect.3
     );
 
     // 5. Allocate port and create session
@@ -112,37 +208,28 @@ async fn create_session(
         .unwrap_or_default()
         .as_secs();
 
-    // 6. Start input pipe for this session
-    state
-        .input
-        .spawn_session_pipe(session_id.clone(), display_rect);
+    // 6. Start input pipe/socket
+    #[cfg(target_os = "linux")]
+    crate::input_router::register_session_display(&session_id, display_id);
 
-    // 7. Launch backend process under user account
+    state.input.spawn_session_pipe(session_id.clone(), display_rect);
+
+    // 7. Launch backend
     let backend_pid = match crate::launcher::launch_backend(
-        &state.sm.backend_path,
-        &account.username,
-        &account.password,
-        port,
-        monitor_index,
-        &session_id,
-        &state.sm.token_secret,
-        &state.sm.gateway_url,
+        &state.sm.backend_path, &account.username, &account.password,
+        port, monitor_index, &session_id,
+        &state.sm.token_secret, &state.sm.gateway_url,
     ) {
         Ok(proc) => {
             let pid = proc.pid;
-            // Store the process handle somewhere we can monitor it
-            // For now, just let it run — the process handle is dropped but the process continues
-            std::mem::forget(proc); // don't close handles
+            std::mem::forget(proc);
             Some(pid)
         }
         Err(e) => {
             error!("Failed to launch backend: {}", e);
-            // Clean up display on failure
             let _ = crate::display::destroy_display(&state.sm.display_ctl_path, display_id);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Backend launch failed: {}", e)})),
-            )
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Backend launch failed: {}", e)})))
                 .into_response();
         }
     };
@@ -151,7 +238,7 @@ async fn create_session(
     let session = UserSession {
         session_id: session_id.clone(),
         user_id: req.user_id.clone(),
-        windows_user: account.username.clone(),
+        os_user: account.username.clone(),
         display_index: display_id,
         display_rect,
         backend_port: port,
@@ -176,7 +263,7 @@ async fn create_session(
             session_id,
             backend_port: port,
             display_index: display_id,
-            windows_user: account.username,
+            os_user: account.username,
         })),
     )
         .into_response()
@@ -189,7 +276,7 @@ async fn list_sessions(State(state): State<ApiState>) -> impl IntoResponse {
         .map(|s| SessionInfo {
             session_id: s.session_id.clone(),
             user_id: s.user_id.clone(),
-            windows_user: s.windows_user.clone(),
+            os_user: s.os_user.clone(),
             display_index: s.display_index,
             display_rect: s.display_rect,
             backend_port: s.backend_port,
@@ -209,7 +296,7 @@ async fn get_session(
         Some(s) => Json(serde_json::json!(SessionInfo {
             session_id: s.session_id.clone(),
             user_id: s.user_id.clone(),
-            windows_user: s.windows_user.clone(),
+            os_user: s.os_user.clone(),
             display_index: s.display_index,
             display_rect: s.display_rect,
             backend_port: s.backend_port,
@@ -225,33 +312,41 @@ async fn destroy_session(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = {
-        let mut sessions = state.sm.sessions.write().await;
-        sessions.remove(&id)
-    };
-
-    match session {
+    // Don't remove the session or kill anything — just log it.
+    // The backend and display stay alive for reconnect.
+    let sessions = state.sm.sessions.read().await;
+    match sessions.get(&id) {
         Some(s) => {
-            info!("Destroying session {}", id);
-
-            // Kill backend process
-            if let Some(pid) = s.backend_pid {
-                let _ = std::process::Command::new(r"C:\Windows\system32\taskkill.exe")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .output();
-                info!("Killed backend pid {}", pid);
-            }
-
-            // Destroy virtual display
-            if let Err(e) =
-                crate::display::destroy_display(&state.sm.display_ctl_path, s.display_index)
-            {
-                warn!("Failed to destroy display {}: {}", s.display_index, e);
-            }
-
-            state.sm.persist_state().await;
+            info!(
+                "Session {} marked inactive (backend pid={:?}, display={} kept alive)",
+                id, s.backend_pid, s.display_index
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new(r"C:\Windows\system32\tasklist.exe")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+        if let Ok(out) = output {
+            let s = String::from_utf8_lossy(&out.stdout);
+            return s.contains("streamio.exe");
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }

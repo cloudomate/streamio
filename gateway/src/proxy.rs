@@ -10,10 +10,18 @@ use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite};
 use tracing::error;
 
-static SCREEN_HTML: &str = include_str!("../../../client/screen.html");
+static SCREEN_HTML: &str = include_str!("../../client/screen.html");
 
-/// GET / — serve the stream UI (requires session) or redirect to login.
+/// GET / — redirect to portal (main entry point) or login.
 pub async fn index_handler(session: Option<RequireSession>) -> Response {
+    match session {
+        Some(_) => Redirect::to("/portal").into_response(),
+        None => Redirect::to("/auth/login").into_response(),
+    }
+}
+
+/// GET /stream — serve the stream UI directly (used by portal iframe).
+pub async fn stream_handler(session: Option<RequireSession>) -> Response {
     match session {
         Some(_) => Html(SCREEN_HTML).into_response(),
         None => Redirect::to("/auth/login").into_response(),
@@ -26,14 +34,10 @@ pub async fn ws_handler(
     RequireSession(claims): RequireSession,
     State(state): State<AppState>,
 ) -> Response {
-    // Resolve backend assignment (auto-provisions a KubeVirt VM on first login if enabled)
+    // Resolve backend assignment (pick least-loaded healthy backend)
     let backend = match state
         .registry
-        .get_or_assign(
-            &claims.sub,
-            state.provisioner.as_ref(),
-            state.default_vm.as_deref(),
-        )
+        .get_or_assign(&claims.sub)
         .await
     {
         Some(b) => b,

@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Streamio VDI</title>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --red: #f85149; --orange: #d29922;
+      --blue: #58a6ff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 14px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* Header */
+    .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 16px; flex-shrink: 0; z-index: 100; }
+    .header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
+    .header-spacer { flex: 1; }
+    .header .user-info { color: var(--muted); font-size: 13px; }
+    .header .user-email { color: var(--text); font-weight: 500; }
+    .header-btn { background: var(--border); border: none; color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; text-decoration: none; }
+    .header-btn:hover { background: #3c4147; }
+    .header-btn.danger { background: rgba(248,81,73,.15); color: var(--red); }
+    .header-btn.danger:hover { background: rgba(248,81,73,.25); }
+
+    /* Portal view */
+    .portal-view { flex: 1; overflow-y: auto; }
+    .portal-content { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+    .portal-title { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+    .portal-subtitle { color: var(--muted); font-size: 14px; margin-bottom: 28px; }
+
+    /* Desktop grid */
+    .desktop-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+
+    /* Desktop card */
+    .desktop-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; transition: border-color .15s; }
+    .desktop-card:hover { border-color: #484f58; }
+    .card-header { padding: 16px 18px 12px; display: flex; align-items: flex-start; gap: 12px; }
+    .card-icon { width: 40px; height: 40px; border-radius: 8px; background: var(--border); display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; color: var(--muted); font-weight: 600; }
+    .card-icon.windows { background: rgba(88,166,255,.12); color: var(--accent); }
+    .card-icon.linux { background: rgba(63,185,80,.12); color: var(--green); }
+    .card-icon.macos { background: rgba(210,153,34,.12); color: var(--orange); }
+    .card-info { flex: 1; min-width: 0; }
+    .card-label { font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .card-platform { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .card-body { padding: 0 18px 16px; }
+    .card-status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .status-dot.available { background: var(--green); }
+    .status-dot.active { background: var(--accent); }
+    .status-dot.offline { background: var(--red); }
+    .status-label { font-size: 13px; }
+    .status-label.available { color: var(--green); }
+    .status-label.active { color: var(--accent); }
+    .status-label.offline { color: var(--red); }
+    .card-meta { font-size: 12px; color: var(--muted); margin-bottom: 14px; font-family: monospace; }
+    .card-actions { display: flex; gap: 8px; }
+    .card-btn { flex: 1; padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; text-align: center; transition: background .15s; }
+    .card-btn.connect { background: rgba(63,185,80,.15); color: var(--green); }
+    .card-btn.connect:hover { background: rgba(63,185,80,.25); }
+    .card-btn.connect:disabled { opacity: .4; cursor: not-allowed; }
+    .card-btn.disconnect { background: rgba(248,81,73,.15); color: var(--red); }
+    .card-btn.disconnect:hover { background: rgba(248,81,73,.25); }
+    .card-btn.open { background: rgba(88,166,255,.15); color: var(--accent); }
+    .card-btn.open:hover { background: rgba(88,166,255,.25); }
+    .card-btn.connecting { background: rgba(210,153,34,.15); color: var(--orange); cursor: wait; }
+
+    /* Empty state */
+    .empty-state { text-align: center; padding: 80px 24px; }
+    .empty-icon { font-size: 48px; color: var(--border); margin-bottom: 16px; }
+    .empty-title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+    .empty-text { color: var(--muted); font-size: 14px; }
+
+    /* Stream view */
+    .stream-view { flex: 1; display: none; flex-direction: column; min-height: 0; }
+    .stream-view.active { display: flex; }
+    .stream-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 6px 16px; display: flex; align-items: center; gap: 12px; flex-shrink: 0; z-index: 100; }
+    .stream-host { font-size: 13px; font-weight: 500; }
+    .stream-status { font-size: 12px; color: var(--green); display: flex; align-items: center; gap: 6px; }
+    .stream-status .status-dot { width: 6px; height: 6px; }
+    .stream-spacer { flex: 1; }
+    .stream-btn { background: var(--border); border: none; color: var(--text); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .stream-btn:hover { background: #3c4147; }
+    .stream-btn.danger { background: rgba(248,81,73,.15); color: var(--red); }
+    .stream-btn.danger:hover { background: rgba(248,81,73,.25); }
+    .stream-frame { flex: 1; border: none; background: #000; min-height: 0; }
+
+    /* Loading spinner */
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Toast notifications */
+    .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
+    .toast { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 16px; font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,.4); animation: toastIn .2s ease; max-width: 360px; }
+    .toast.error { border-color: var(--red); color: var(--red); }
+    .toast.success { border-color: var(--green); color: var(--green); }
+    @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      .desktop-grid { grid-template-columns: 1fr; }
+      .header { padding: 10px 16px; gap: 10px; }
+      .portal-content { padding: 20px 16px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Main header (always visible) -->
+  <div class="header" id="mainHeader">
+    <h1>Streamio VDI</h1>
+    <div class="header-spacer"></div>
+    <span class="user-info">
+      <span class="user-email" id="userEmail">...</span>
+    </span>
+    <a href="/auth/logout" class="header-btn">Logout</a>
+  </div>
+
+  <!-- Portal view: desktop list -->
+  <div class="portal-view" id="portalView">
+    <div class="portal-content">
+      <div class="portal-title">Your Desktops</div>
+      <div class="portal-subtitle">Select a VDI desktop to connect</div>
+      <div id="desktopList"></div>
+    </div>
+  </div>
+
+  <!-- Stream view: embedded iframe -->
+  <div class="stream-view" id="streamView">
+    <div class="stream-header">
+      <span class="stream-host" id="streamHost">--</span>
+      <span class="stream-status"><span class="status-dot active"></span> Connected</span>
+      <div class="stream-spacer"></div>
+      <button class="stream-btn" onclick="toggleStreamFullscreen()">Fullscreen</button>
+      <button class="stream-btn danger" onclick="disconnectStream()">Disconnect</button>
+      <button class="stream-btn" onclick="exitStream()">Back to Portal</button>
+    </div>
+    <iframe class="stream-frame" id="streamFrame" allowfullscreen allow="autoplay; microphone; camera; clipboard-write; clipboard-read"></iframe>
+  </div>
+
+  <!-- Toast container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+<script>
+  /* ---- State ---- */
+  let currentUser = null;
+  let vdiList = [];
+  let activeStreamSession = null; /* { session_id, host_id, host_label, stream_url } */
+  let pollTimer = null;
+  let connectingHostId = null;
+
+  /* ---- API helpers ---- */
+  async function apiFetch(path, opts) {
+    const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(text || `HTTP ${res.status}`);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  }
+
+  /* ---- Toast ---- */
+  function showToast(message, type) {
+    const el = document.createElement('div');
+    el.className = 'toast ' + (type || '');
+    el.textContent = message;
+    document.getElementById('toastContainer').appendChild(el);
+    setTimeout(() => { el.remove(); }, 4000);
+  }
+
+  /* ---- Load user info ---- */
+  async function loadUser() {
+    try {
+      currentUser = await apiFetch('/api/me');
+      document.getElementById('userEmail').textContent = currentUser.email || currentUser.sub || 'User';
+    } catch (e) {
+      document.getElementById('userEmail').textContent = 'Not signed in';
+      showToast('Failed to load user info: ' + e.message, 'error');
+    }
+  }
+
+  /* ---- Load VDI list ---- */
+  async function loadVDIs() {
+    try {
+      vdiList = await apiFetch('/api/me/vdis');
+    } catch (e) {
+      vdiList = [];
+      /* Only show error on first load, not on every poll */
+      if (!pollTimer) showToast('Failed to load desktops: ' + e.message, 'error');
+    }
+    renderDesktops();
+  }
+
+  /* ---- Platform helpers ---- */
+  function platformIcon(platform) {
+    const p = (platform || '').toLowerCase();
+    if (p.includes('win')) return { cls: 'windows', label: 'W', name: 'Windows' };
+    if (p.includes('linux') || p.includes('ubuntu') || p.includes('debian') || p.includes('centos')) return { cls: 'linux', label: 'L', name: 'Linux' };
+    if (p.includes('mac') || p.includes('darwin')) return { cls: 'macos', label: 'M', name: 'macOS' };
+    return { cls: '', label: '?', name: platform || 'Unknown' };
+  }
+
+  function statusInfo(session) {
+    if (!session) return { cls: 'available', label: 'Available', detail: '' };
+    if (session.status === 'active' || session.status === 'connected') {
+      const res = session.resolution ? session.resolution : '';
+      return { cls: 'active', label: 'Session Active', detail: res };
+    }
+    return { cls: 'offline', label: 'Offline', detail: '' };
+  }
+
+  /* ---- Render desktops ---- */
+  function renderDesktops() {
+    const container = document.getElementById('desktopList');
+
+    if (!vdiList || vdiList.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">&#9634;</div>
+          <div class="empty-title">No VDI desktops assigned</div>
+          <div class="empty-text">Contact your administrator to get a desktop assigned to your account.</div>
+        </div>`;
+      return;
+    }
+
+    container.innerHTML = '<div class="desktop-grid">' + vdiList.map(vdi => {
+      const pi = platformIcon(vdi.platform);
+      const si = statusInfo(vdi.session);
+      const isConnecting = connectingHostId === vdi.host_id;
+      const hasSession = vdi.session && (vdi.session.status === 'active' || vdi.session.status === 'connected');
+      const isOffline = !vdi.session && vdi.status === 'offline';
+
+      let actions = '';
+      if (isConnecting) {
+        actions = `<button class="card-btn connecting" disabled><span class="spinner"></span>Connecting...</button>`;
+      } else if (hasSession) {
+        actions = `<button class="card-btn connect" onclick="openStream('${esc(vdi.host_id)}')">Connect</button>`;
+      } else {
+        actions = `<button class="card-btn connect" onclick="connectHost('${esc(vdi.host_id)}')" ${isOffline ? 'disabled' : ''}>Connect</button>`;
+      }
+
+      return `
+        <div class="desktop-card">
+          <div class="card-header">
+            <div class="card-icon ${pi.cls}">${pi.label}</div>
+            <div class="card-info">
+              <div class="card-label">${esc(vdi.host_label || vdi.host_id)}</div>
+              <div class="card-platform">${esc(pi.name)}</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="card-status">
+              <span class="status-dot ${si.cls}"></span>
+              <span class="status-label ${si.cls}">${si.label}</span>
+            </div>
+            ${si.detail ? `<div class="card-meta">${esc(si.detail)}</div>` : ''}
+            <div class="card-actions">${actions}</div>
+          </div>
+        </div>`;
+    }).join('') + '</div>';
+  }
+
+  /* ---- Escape HTML ---- */
+  function esc(s) {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  /* ---- Connect to a host ---- */
+  async function connectHost(hostId) {
+    connectingHostId = hostId;
+    renderDesktops();
+
+    try {
+      const result = await apiFetch('/api/me/connect', {
+        method: 'POST',
+        body: JSON.stringify({ host_id: hostId })
+      });
+
+      connectingHostId = null;
+
+      const vdi = vdiList.find(v => v.host_id === hostId);
+      window.open(result.stream_url, '_blank');
+      showToast('Connected — opening in new tab', 'success');
+      await loadVDIs();
+    } catch (e) {
+      connectingHostId = null;
+      renderDesktops();
+      showToast('Connection failed: ' + e.message, 'error');
+    }
+  }
+
+  /* ---- Open an existing stream ---- */
+  function openStream(hostId) {
+    const vdi = vdiList.find(v => v.host_id === hostId);
+    if (!vdi || !vdi.session) return;
+    window.open(vdi.session.stream_url, '_blank');
+  }
+
+  /* ---- Disconnect a session ---- */
+  async function disconnectHost(hostId, sessionId) {
+    try {
+      await apiFetch('/api/me/disconnect', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: sessionId })
+      });
+      showToast('Disconnected', 'success');
+    } catch (e) {
+      showToast('Disconnect failed: ' + e.message, 'error');
+    }
+    await loadVDIs();
+  }
+
+  /* ---- Stream view ---- */
+  function showStreamView() {
+    if (!activeStreamSession) return;
+
+    document.getElementById('portalView').style.display = 'none';
+    document.getElementById('streamView').classList.add('active');
+    document.getElementById('streamHost').textContent = activeStreamSession.host_label;
+    document.getElementById('streamFrame').src = activeStreamSession.stream_url;
+
+    /* Pause polling while streaming */
+    stopPolling();
+  }
+
+  function exitStream() {
+    document.getElementById('streamView').classList.remove('active');
+    document.getElementById('streamFrame').src = 'about:blank';
+    document.getElementById('portalView').style.display = '';
+    activeStreamSession = null;
+
+    loadVDIs();
+    startPolling();
+  }
+
+  async function disconnectStream() {
+    if (!activeStreamSession) return;
+
+    try {
+      await apiFetch('/api/me/disconnect', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: activeStreamSession.session_id })
+      });
+      showToast('Disconnected', 'success');
+    } catch (e) {
+      showToast('Disconnect failed: ' + e.message, 'error');
+    }
+
+    exitStream();
+  }
+
+  function toggleStreamFullscreen() {
+    const frame = document.getElementById('streamFrame');
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else {
+      frame.requestFullscreen().catch(() => {});
+    }
+  }
+
+  /* ---- Polling ---- */
+  function startPolling() {
+    stopPolling();
+    pollTimer = setInterval(loadVDIs, 10000);
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  /* ---- Keyboard shortcut: Escape exits stream view ---- */
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && activeStreamSession && !document.fullscreenElement) {
+      exitStream();
+    }
+  });
+
+  /* ---- Init ---- */
+  async function init() {
+    await loadUser();
+    await loadVDIs();
+    startPolling();
+  }
+
+  init();
+</script>
+</body>
+</html>

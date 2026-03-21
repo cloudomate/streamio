@@ -79,50 +79,6 @@ pub enum InputEvent {
     KeyUp { key: String, code: String, modifiers: Modifiers },
 }
 
-// ── VM provisioning ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OsType {
-    Windows11,
-    Ubuntu,
-    Alpine,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VmType {
-    Kubevirt,
-    External,
-}
-
-/// Admin API request body for provisioning a new VM per user.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ProvisionRequest {
-    pub user_sub: String,
-    pub os_type: OsType,
-    /// Name of the base image PVC to clone, e.g. "ubuntu-22.04-base"
-    pub base_pvc: String,
-    /// e.g. "60Gi"
-    pub disk_size: String,
-    /// e.g. "4Gi"
-    pub memory: String,
-    pub cpu_cores: u32,
-    pub label: Option<String>,
-}
-
-/// VM metadata stored alongside a backend record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VmInfo {
-    pub vm_type: VmType,
-    pub vm_name: String,
-    pub vm_ns: String,
-    pub os_type: OsType,
-    pub disk_pvc: String,
-    /// Power state: "stopped" | "starting" | "running" | "stopping" | "provisioning"
-    pub state: String,
-}
-
 // ── Admin API payloads ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,7 +110,10 @@ pub struct SessionResponse {
     pub session_id: String,
     pub backend_port: u16,
     pub display_index: u32,
-    pub windows_user: String,
+    /// OS-level username for the session (e.g., streamio_a1b2c3d4).
+    /// Aliased from `windows_user` for backward compatibility.
+    #[serde(alias = "windows_user")]
+    pub os_user: String,
 }
 
 /// Status of an active session.
@@ -162,12 +121,24 @@ pub struct SessionResponse {
 pub struct SessionInfo {
     pub session_id: String,
     pub user_id: String,
-    pub windows_user: String,
+    /// OS-level username for the session.
+    /// Aliased from `windows_user` for backward compatibility.
+    #[serde(alias = "windows_user")]
+    pub os_user: String,
     pub display_index: u32,
     pub display_rect: (i32, i32, u32, u32),
     pub backend_port: u16,
     pub backend_pid: Option<u32>,
     pub created_at: u64,
+}
+
+/// Host platform type for session manager.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPlatform {
+    Windows,
+    Linux,
+    MacOs,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,4 +153,71 @@ pub struct UserAssignment {
 pub struct BackendStatus {
     pub info: BackendInfo,
     pub active_sessions: u32,
+}
+
+// ── Host management (multi-machine VDI fleet) ───────────────────────────────
+
+/// A host machine running the session manager agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub id: Uuid,
+    /// Session manager API URL, e.g. "http://192.168.1.10:9100"
+    pub url: String,
+    pub label: Option<String>,
+    pub platform: HostPlatform,
+    pub healthy: bool,
+    pub max_sessions: u32,
+    pub active_sessions: u32,
+}
+
+/// Request from session manager agent to register with gateway.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HostRegisterRequest {
+    pub id: Uuid,
+    pub url: String,
+    pub label: Option<String>,
+    pub platform: HostPlatform,
+    pub max_sessions: u32,
+}
+
+/// User's view of their assigned VDI(s).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserVdi {
+    pub host_id: Uuid,
+    pub host_label: Option<String>,
+    pub platform: String,
+    /// Active session on this host (if any)
+    pub session: Option<UserVdiSession>,
+}
+
+/// An active VDI session from the user's perspective.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserVdiSession {
+    pub session_id: String,
+    pub backend_port: u16,
+    /// Direct URL to the backend WebRTC stream
+    pub stream_url: String,
+    pub status: String,
+}
+
+/// Admin request to assign a user to a host.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserHostAssignment {
+    pub user_sub: String,
+    pub host_id: Uuid,
+    pub priority: Option<i32>,
+}
+
+/// Admin view of a VDI session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VdiSessionInfo {
+    pub id: String,
+    pub user_sub: String,
+    pub user_email: Option<String>,
+    pub host_id: Uuid,
+    pub host_label: Option<String>,
+    pub backend_port: u16,
+    pub os_user: Option<String>,
+    pub status: String,
+    pub created_at: String,
 }

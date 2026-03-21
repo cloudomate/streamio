@@ -373,7 +373,10 @@ impl ScreenStreamer {
         Ok(())
     }
 
-    /// Set up handler for incoming audio from browser (mic → local speakers)
+    /// Set up handler for incoming audio from browser (mic).
+    /// Currently drops mic audio to avoid feedback loops (loopback capture
+    /// picks up speaker output → sends it back → loop).
+    /// TODO: Route to virtual audio input device for VDI apps (Teams, Zoom).
     fn setup_incoming_audio(pipeline: &gst::Pipeline, webrtcbin: &gst::Element) {
         let pipeline_weak = pipeline.downgrade();
 
@@ -383,7 +386,6 @@ impl ScreenStreamer {
                 None => return,
             };
 
-            // Only handle incoming media (not our outgoing streams)
             if pad.direction() != gst::PadDirection::Src {
                 return;
             }
@@ -398,36 +400,26 @@ impl ScreenStreamer {
             let media = s.get::<&str>("media").unwrap_or("");
 
             if media == "audio" {
-                tracing::info!("Incoming audio stream detected");
+                tracing::info!("Incoming mic audio detected — dropping (no virtual audio device)");
 
-                // Create audio playback pipeline
+                // Send to fakesink to avoid feedback loop.
+                // When a virtual audio cable is installed, this can route to it instead.
                 let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
                 let dec = gst::ElementFactory::make("opusdec").build().unwrap();
-                let convert = gst::ElementFactory::make("audioconvert").build().unwrap();
-                let resample = gst::ElementFactory::make("audioresample").build().unwrap();
-
-                #[cfg(target_os = "macos")]
-                let sink = gst::ElementFactory::make("osxaudiosink").build().unwrap();
-
-                #[cfg(target_os = "linux")]
-                let sink = gst::ElementFactory::make("pulsesink")
+                let sink = gst::ElementFactory::make("fakesink")
+                    .property("async", false)
                     .build()
-                    .unwrap_or_else(|_| gst::ElementFactory::make("alsasink").build().unwrap());
+                    .unwrap();
 
-                #[cfg(target_os = "windows")]
-                let sink = gst::ElementFactory::make("wasapisink").build().unwrap();
+                pipeline.add_many([&depay, &dec, &sink]).unwrap();
+                gst::Element::link_many([&depay, &dec, &sink]).unwrap();
 
-                pipeline.add_many([&depay, &dec, &convert, &resample, &sink]).unwrap();
-                gst::Element::link_many([&depay, &dec, &convert, &resample, &sink]).unwrap();
-
-                for elem in [&depay, &dec, &convert, &resample, &sink] {
+                for elem in [&depay, &dec, &sink] {
                     elem.sync_state_with_parent().unwrap();
                 }
 
                 let depay_sink = depay.static_pad("sink").unwrap();
                 pad.link(&depay_sink).unwrap();
-
-                tracing::info!("Browser microphone audio routed to local speakers");
             }
         });
     }

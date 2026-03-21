@@ -25,3 +25,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Gateway self-registration & HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+hostname = "0.4"
+
+# Unix file locking (Linux/macOS)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

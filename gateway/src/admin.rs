@@ -7,11 +7,11 @@ use axum::{
 };
 use serde::Serialize;
 use sqlx::Row;
-use streamio_types::{AssignRequest, BackendInfo, ProvisionRequest, ShadowRequest, UserAssignment};
+use streamio_types::{AssignRequest, BackendInfo, ShadowRequest, UserAssignment};
 use tracing::error;
 use uuid::Uuid;
 
-static ADMIN_HTML: &str = include_str!("../../../client/admin.html");
+static ADMIN_HTML: &str = include_str!("../../client/admin.html");
 
 /// GET /admin — serve admin panel UI.
 pub async fn admin_ui_handler(_: RequireAdmin) -> impl IntoResponse {
@@ -48,237 +48,6 @@ pub async fn list_backends(
         .into_response(),
         Err(e) => {
             error!("list_backends error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// POST /admin/api/backends/provision — provision a new KubeVirt VM for a user.
-pub async fn provision_backend(
-    _: RequireAdmin,
-    State(state): State<AppState>,
-    Json(req): Json<ProvisionRequest>,
-) -> impl IntoResponse {
-    let provisioner = match &state.provisioner {
-        Some(p) => p.clone(),
-        None => {
-            return (StatusCode::NOT_IMPLEMENTED, "KubeVirt provisioner is not enabled")
-                .into_response()
-        }
-    };
-
-    let backend_id = Uuid::new_v4();
-
-    let handle = match provisioner.provision(&req, backend_id).await {
-        Ok(h) => h,
-        Err(e) => {
-            error!("provision_backend error: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let os_type_str = match &req.os_type {
-        streamio_types::OsType::Windows11 => "windows11",
-        streamio_types::OsType::Ubuntu => "ubuntu",
-        streamio_types::OsType::Alpine => "alpine",
-    };
-
-    match sqlx::query(
-        "INSERT INTO backends (id, url, label, healthy, last_seen, vm_type, vm_name, vm_ns, os_type, disk_pvc)
-         VALUES ($1, 'pending://provisioning', $2, false, now(), 'kubevirt', $3, $4, $5, $6)",
-    )
-    .bind(backend_id)
-    .bind(&req.label)
-    .bind(&handle.vm_name)
-    .bind(&handle.ns)
-    .bind(os_type_str)
-    .bind(&handle.disk_pvc)
-    .execute(&state.db)
-    .await
-    {
-        Ok(_) => {}
-        Err(e) => {
-            error!("Failed to insert provisioned backend: {e}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
-
-    let _ = sqlx::query(
-        "INSERT INTO vm_states (backend_id, state) VALUES ($1, 'stopped')",
-    )
-    .bind(backend_id)
-    .execute(&state.db)
-    .await;
-
-    Json(BackendStatusResponse {
-        id: backend_id,
-        url: "pending://provisioning".into(),
-        label: req.label.clone(),
-        healthy: false,
-    })
-    .into_response()
-}
-
-// ── VM lifecycle management ───────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct VmStateResponse {
-    backend_id: Uuid,
-    state: String,
-}
-
-/// POST /admin/api/vms/:id/start — power on a stopped VM.
-pub async fn vm_start(
-    _: RequireAdmin,
-    State(state): State<AppState>,
-    Path(backend_id): Path<Uuid>,
-) -> impl IntoResponse {
-    let provisioner = match &state.provisioner {
-        Some(p) => p.clone(),
-        None => {
-            return (StatusCode::NOT_IMPLEMENTED, "KubeVirt provisioner is not enabled")
-                .into_response()
-        }
-    };
-
-    let (vm_name, vm_ns) = match state.registry.get_vm_columns(backend_id).await {
-        Some(cols) => cols,
-        None => return (StatusCode::NOT_FOUND, "VM not found").into_response(),
-    };
-
-    match provisioner.start(&vm_name, &vm_ns).await {
-        Ok(_) => {
-            let _ = sqlx::query(
-                "INSERT INTO vm_states (backend_id, state)
-                 VALUES ($1, 'starting')
-                 ON CONFLICT (backend_id) DO UPDATE SET state = 'starting', updated_at = now()",
-            )
-            .bind(backend_id)
-            .execute(&state.db)
-            .await;
-            StatusCode::OK.into_response()
-        }
-        Err(e) => {
-            error!("vm_start error for {backend_id}: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// POST /admin/api/vms/:id/stop — gracefully power off a running VM.
-pub async fn vm_stop(
-    _: RequireAdmin,
-    State(state): State<AppState>,
-    Path(backend_id): Path<Uuid>,
-) -> impl IntoResponse {
-    let provisioner = match &state.provisioner {
-        Some(p) => p.clone(),
-        None => {
-            return (StatusCode::NOT_IMPLEMENTED, "KubeVirt provisioner is not enabled")
-                .into_response()
-        }
-    };
-
-    let (vm_name, vm_ns) = match state.registry.get_vm_columns(backend_id).await {
-        Some(cols) => cols,
-        None => return (StatusCode::NOT_FOUND, "VM not found").into_response(),
-    };
-
-    match provisioner.stop(&vm_name, &vm_ns).await {
-        Ok(_) => {
-            let _ = sqlx::query(
-                "INSERT INTO vm_states (backend_id, state)
-                 VALUES ($1, 'stopping')
-                 ON CONFLICT (backend_id) DO UPDATE SET state = 'stopping', updated_at = now()",
-            )
-            .bind(backend_id)
-            .execute(&state.db)
-            .await;
-            // Mark backend as unhealthy since it's shutting down
-            state.registry.set_health(backend_id, false).await;
-            StatusCode::OK.into_response()
-        }
-        Err(e) => {
-            error!("vm_stop error for {backend_id}: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
-/// DELETE /admin/api/vms/:id — delete VM, DataVolume, and PVC.
-pub async fn vm_delete(
-    _: RequireAdmin,
-    State(state): State<AppState>,
-    Path(backend_id): Path<Uuid>,
-) -> impl IntoResponse {
-    let provisioner = match &state.provisioner {
-        Some(p) => p.clone(),
-        None => {
-            return (StatusCode::NOT_IMPLEMENTED, "KubeVirt provisioner is not enabled")
-                .into_response()
-        }
-    };
-
-    let (vm_name, vm_ns) = match state.registry.get_vm_columns(backend_id).await {
-        Some(cols) => cols,
-        None => return (StatusCode::NOT_FOUND, "VM not found").into_response(),
-    };
-
-    let disk_pvc = state
-        .registry
-        .get_disk_pvc(backend_id)
-        .await
-        .unwrap_or_default();
-
-    if let Err(e) = provisioner.delete(&vm_name, &vm_ns, &disk_pvc).await {
-        error!("vm_delete error for {backend_id}: {e}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    // Remove backend + cascading vm_states/assignments rows
-    let _ = sqlx::query("DELETE FROM backends WHERE id = $1")
-        .bind(backend_id)
-        .execute(&state.db)
-        .await;
-
-    StatusCode::NO_CONTENT.into_response()
-}
-
-/// GET /admin/api/vms/:id/state — query live power state from KubeVirt.
-pub async fn vm_state(
-    _: RequireAdmin,
-    State(state): State<AppState>,
-    Path(backend_id): Path<Uuid>,
-) -> impl IntoResponse {
-    let provisioner = match &state.provisioner {
-        Some(p) => p.clone(),
-        None => {
-            return (StatusCode::NOT_IMPLEMENTED, "KubeVirt provisioner is not enabled")
-                .into_response()
-        }
-    };
-
-    let (vm_name, vm_ns) = match state.registry.get_vm_columns(backend_id).await {
-        Some(cols) => cols,
-        None => return (StatusCode::NOT_FOUND, "VM not found").into_response(),
-    };
-
-    match provisioner.state(&vm_name, &vm_ns).await {
-        Ok(s) => {
-            // Sync to vm_states table
-            let _ = sqlx::query(
-                "INSERT INTO vm_states (backend_id, state)
-                 VALUES ($1, $2)
-                 ON CONFLICT (backend_id) DO UPDATE SET state = $2, updated_at = now()",
-            )
-            .bind(backend_id)
-            .bind(&s)
-            .execute(&state.db)
-            .await;
-            Json(VmStateResponse { backend_id, state: s }).into_response()
-        }
-        Err(e) => {
-            error!("vm_state error for {backend_id}: {e}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -370,7 +139,7 @@ pub struct SessionInfo {
     pub active: bool,
 }
 
-/// GET /admin/api/sessions — proxies to backend /healthz for now.
+/// GET /admin/api/sessions
 pub async fn list_sessions(
     _: RequireAdmin,
     State(state): State<AppState>,
@@ -394,7 +163,7 @@ pub async fn list_sessions(
     }
 }
 
-/// POST /admin/api/sessions/:id/shadow — assign observer role to a user on a session.
+/// POST /admin/api/sessions/:id/shadow
 pub async fn shadow_session(
     _: RequireAdmin,
     State(state): State<AppState>,
@@ -419,12 +188,10 @@ pub async fn shadow_session(
     }
 }
 
-/// DELETE /admin/api/sessions/:id — not yet implemented (requires backend API).
+/// DELETE /admin/api/sessions/:id
 pub async fn disconnect_session(
     _: RequireAdmin,
     Path(_backend_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    // TODO (Phase 4): POST to backend /sessions/:id/disconnect
-    (StatusCode::NOT_IMPLEMENTED, "Force-disconnect not yet implemented")
+    (StatusCode::NOT_IMPLEMENTED, "Use /admin/api/vdi-sessions/:id instead")
 }
-

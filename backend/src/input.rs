@@ -2,66 +2,50 @@
 //!
 //! On Windows with a session manager, input events are forwarded to
 //! a per-session named pipe: `\\.\pipe\streamio-input-<session_id>`.
-//! The session manager handles coordinate translation and VHID injection.
 //!
-//! Falls back to enigo (direct injection) on non-Windows or when no
-//! session pipe is available (standalone/dev mode).
+//! On Linux/macOS with a session manager, input events are forwarded to
+//! a per-session Unix domain socket: `/tmp/streamio-input-<session_id>.sock`.
+//!
+//! The session manager handles coordinate translation and input injection.
+//!
+//! Falls back to enigo (direct injection) when no session pipe/socket is
+//! available (standalone/dev mode).
 
 use std::sync::Mutex;
 use streamio_types::InputEvent;
 
-/// Input controller — routes events to the appropriate injection path.
+// ═══════════════════════════════════════════════════════════════════════════════
+// Windows implementation — named pipes to session manager
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_os = "windows")]
 pub struct InputController {
-    /// Per-session pipe (Windows with session manager)
-    #[cfg(target_os = "windows")]
     pipe: Mutex<PipeState>,
-    /// Fallback direct injection (non-Windows or dev mode)
-    #[cfg(not(target_os = "windows"))]
-    enigo: Mutex<enigo::Enigo>,
 }
 
 #[cfg(target_os = "windows")]
 enum PipeState {
-    /// Connected to session manager pipe
     Connected(std::fs::File),
-    /// Using legacy shared pipe (streamio-service)
     Legacy(std::fs::File),
-    /// Not connected yet
-    Disconnected {
-        session_id: Option<String>,
-    },
+    Disconnected { session_id: Option<String> },
 }
 
+#[cfg(target_os = "windows")]
 impl InputController {
     pub fn new() -> Self {
-        #[cfg(target_os = "windows")]
-        {
-            Self::set_dpi_aware();
+        Self::set_dpi_aware();
 
-            let session_id = std::env::var("SESSION_ID").ok();
+        let session_id = std::env::var("SESSION_ID").ok();
 
-            // If no SESSION_ID, try to spawn the legacy service helper
-            if session_id.is_none() {
-                Self::spawn_input_helper();
-            }
-
-            Self {
-                pipe: Mutex::new(PipeState::Disconnected { session_id }),
-            }
+        if session_id.is_none() {
+            Self::spawn_input_helper();
         }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            let enigo = enigo::Enigo::new(&enigo::Settings::default())
-                .expect("Failed to create Enigo");
-            Self {
-                enigo: Mutex::new(enigo),
-            }
+        Self {
+            pipe: Mutex::new(PipeState::Disconnected { session_id }),
         }
     }
 
-    /// Spawn the legacy input helper (when not using session manager).
-    #[cfg(target_os = "windows")]
     fn spawn_input_helper() {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
@@ -107,7 +91,6 @@ impl InputController {
         tracing::info!("No input helper found — lock screen input unavailable in dev mode");
     }
 
-    #[cfg(target_os = "windows")]
     fn set_dpi_aware() {
         use std::ffi::c_void;
         type DPI_AWARENESS_CONTEXT = *mut c_void;
@@ -131,20 +114,9 @@ impl InputController {
     }
 
     pub fn handle_event(&self, event: &InputEvent) {
-        #[cfg(target_os = "windows")]
-        {
-            self.send_to_pipe(event);
-            return;
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.handle_event_enigo(event);
-        }
+        self.send_to_pipe(event);
     }
 
-    /// Send event to the appropriate named pipe (session or legacy).
-    #[cfg(target_os = "windows")]
     fn send_to_pipe(&self, event: &InputEvent) {
         use std::io::Write;
 
@@ -158,7 +130,6 @@ impl InputController {
             Err(_) => return,
         };
 
-        // Try to write on existing connection
         match &mut *guard {
             PipeState::Connected(ref mut pipe) | PipeState::Legacy(ref mut pipe) => {
                 let len = (json.len() as u32).to_le_bytes();
@@ -168,19 +139,16 @@ impl InputController {
                 {
                     return;
                 }
-                // Connection broken — fall through to reconnect
                 tracing::warn!("Input pipe broken, reconnecting");
             }
             PipeState::Disconnected { .. } => {}
         }
 
-        // Extract session_id before replacing state
         let session_id = match &*guard {
             PipeState::Disconnected { session_id } => session_id.clone(),
             _ => std::env::var("SESSION_ID").ok(),
         };
 
-        // Try to connect
         let pipe_name = if let Some(ref sid) = session_id {
             format!(r"\\.\pipe\streamio-input-{}", sid)
         } else {
@@ -203,25 +171,168 @@ impl InputController {
                     return;
                 }
             }
-            Err(_e) => {
-                // Silently retry next event — avoid log spam
-            }
+            Err(_e) => {}
         }
 
         *guard = PipeState::Disconnected { session_id };
     }
+}
 
-    #[cfg(not(target_os = "windows"))]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Unix implementation — Unix domain sockets or enigo fallback
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(not(target_os = "windows"))]
+pub struct InputController {
+    /// Unix domain socket to session manager (when SESSION_ID is set)
+    socket: Mutex<SocketState>,
+    /// Fallback direct injection (dev mode, no session manager)
+    enigo: Mutex<Option<enigo::Enigo>>,
+}
+
+#[cfg(not(target_os = "windows"))]
+enum SocketState {
+    Connected(std::os::unix::net::UnixStream),
+    Disconnected { session_id: Option<String> },
+}
+
+#[cfg(not(target_os = "windows"))]
+impl InputController {
+    pub fn new() -> Self {
+        let session_id = std::env::var("SESSION_ID").ok();
+
+        // Try to connect to session manager socket immediately
+        let (socket_state, need_enigo) = if let Some(ref sid) = session_id {
+            let sock_path = format!("/tmp/streamio-input-{}.sock", sid);
+            match std::os::unix::net::UnixStream::connect(&sock_path) {
+                Ok(stream) => {
+                    tracing::info!("Connected to session manager socket: {}", sock_path);
+                    (SocketState::Connected(stream), false)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to connect to session socket {} (will retry): {}",
+                        sock_path,
+                        e
+                    );
+                    (
+                        SocketState::Disconnected {
+                            session_id: session_id.clone(),
+                        },
+                        false, // Don't create enigo yet — will retry socket first
+                    )
+                }
+            }
+        } else {
+            // No session manager — use enigo for direct injection (dev mode)
+            (SocketState::Disconnected { session_id: None }, true)
+        };
+
+        let enigo = if need_enigo {
+            match enigo::Enigo::new(&enigo::Settings::default()) {
+                Ok(e) => Some(e),
+                Err(err) => {
+                    tracing::warn!("Failed to create Enigo: {}", err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        Self {
+            socket: Mutex::new(socket_state),
+            enigo: Mutex::new(enigo),
+        }
+    }
+
+    pub fn handle_event(&self, event: &InputEvent) {
+        // Try Unix socket first (session manager mode)
+        if self.send_to_socket(event) {
+            return;
+        }
+
+        // Fallback to enigo (dev mode)
+        self.handle_event_enigo(event);
+    }
+
+    /// Send event via Unix domain socket. Returns true if sent successfully.
+    fn send_to_socket(&self, event: &InputEvent) -> bool {
+        use std::io::Write;
+
+        let json = match serde_json::to_vec(event) {
+            Ok(j) => j,
+            Err(_) => return false,
+        };
+
+        let mut guard = match self.socket.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+
+        // Try writing on existing connection
+        if let SocketState::Connected(ref mut stream) = *guard {
+            let len = (json.len() as u32).to_le_bytes();
+            if stream.write_all(&len).is_ok()
+                && stream.write_all(&json).is_ok()
+                && stream.flush().is_ok()
+            {
+                return true;
+            }
+            tracing::warn!("Session socket broken, reconnecting");
+        }
+
+        // Extract session_id for reconnect
+        let session_id = match &*guard {
+            SocketState::Disconnected { session_id } => session_id.clone(),
+            _ => std::env::var("SESSION_ID").ok(),
+        };
+
+        // No session ID means no session manager to connect to
+        let sid = match &session_id {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Try reconnecting
+        let sock_path = format!("/tmp/streamio-input-{}.sock", sid);
+        match std::os::unix::net::UnixStream::connect(&sock_path) {
+            Ok(mut stream) => {
+                let len = (json.len() as u32).to_le_bytes();
+                if stream.write_all(&len).is_ok()
+                    && stream.write_all(&json).is_ok()
+                    && stream.flush().is_ok()
+                {
+                    tracing::info!("Reconnected to session socket: {}", sock_path);
+                    *guard = SocketState::Connected(stream);
+                    return true;
+                }
+            }
+            Err(_) => {}
+        }
+
+        *guard = SocketState::Disconnected { session_id };
+        false
+    }
+
     fn handle_event_enigo(&self, event: &InputEvent) {
         use enigo::{Button, Coordinate, Direction, Keyboard, Mouse};
 
+        let mut guard = match self.enigo.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        let enigo = match guard.as_mut() {
+            Some(e) => e,
+            None => return,
+        };
+
         match event {
             InputEvent::MouseMove { x, y } => {
-                let mut enigo = self.enigo.lock().unwrap();
                 let _ = enigo.move_mouse(*x, *y, Coordinate::Abs);
             }
             InputEvent::MouseDown { button, x, y } => {
-                let mut enigo = self.enigo.lock().unwrap();
                 let _ = enigo.move_mouse(*x, *y, Coordinate::Abs);
                 let btn = match button {
                     0 => Button::Left,
@@ -232,7 +343,6 @@ impl InputController {
                 let _ = enigo.button(btn, Direction::Press);
             }
             InputEvent::MouseUp { button, x, y } => {
-                let mut enigo = self.enigo.lock().unwrap();
                 let _ = enigo.move_mouse(*x, *y, Coordinate::Abs);
                 let btn = match button {
                     0 => Button::Left,
@@ -245,27 +355,16 @@ impl InputController {
             InputEvent::Scroll { dx: _, dy } => {
                 let amount = (-*dy / 10.0) as i32;
                 if amount != 0 {
-                    let mut enigo = self.enigo.lock().unwrap();
                     let _ = enigo.scroll(amount, enigo::Axis::Vertical);
                 }
             }
-            InputEvent::KeyDown {
-                key,
-                code: _,
-                modifiers: _,
-            } => {
+            InputEvent::KeyDown { key, .. } => {
                 if let Some(k) = map_key(key) {
-                    let mut enigo = self.enigo.lock().unwrap();
                     let _ = enigo.key(k, Direction::Press);
                 }
             }
-            InputEvent::KeyUp {
-                key,
-                code: _,
-                modifiers: _,
-            } => {
+            InputEvent::KeyUp { key, .. } => {
                 if let Some(k) = map_key(key) {
-                    let mut enigo = self.enigo.lock().unwrap();
                     let _ = enigo.key(k, Direction::Release);
                 }
             }

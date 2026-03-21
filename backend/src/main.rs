@@ -141,7 +141,12 @@ async fn main() -> Result<()> {
     tracing::info!("Open http://localhost:{} to view", port);
 
     // Start server
-    screen_server::run_server(fps, port).await?;
+    let token_secret = std::env::var("BACKEND_TOKEN_SECRET").unwrap_or_default();
+    let enable_audio = std::env::var("ENABLE_AUDIO")
+        .map(|s| s == "0" || s.eq_ignore_ascii_case("false"))
+        .map(|disabled| !disabled)
+        .unwrap_or(true); // Audio ON by default
+    screen_server::run(fps, port, token_secret, enable_audio).await?;
 
     Ok(())
 }

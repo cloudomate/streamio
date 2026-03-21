@@ -131,11 +131,13 @@
             if (ws) { ws.close(); ws = null; }
 
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            // Forward ?display=N query param to WebSocket URL
             const urlParams = new URLSearchParams(location.search);
             const displayParam = urlParams.get('display');
             const wsQuery = displayParam ? `?display=${displayParam}` : '';
-            ws = new WebSocket(`${protocol}//${location.host}/ws${wsQuery}`);
+            // If loaded at /vdi/{session_id}, use /vdi/{session_id}/ws
+            // Otherwise fall back to /ws (legacy direct mode)
+            const wsPath = location.pathname.startsWith('/vdi/') ? location.pathname + '/ws' : '/ws';
+            ws = new WebSocket(`${protocol}//${location.host}${wsPath}${wsQuery}`);
 
             ws.onopen = () => {
                 console.log('WebSocket connected');

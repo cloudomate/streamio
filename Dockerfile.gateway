@@ -1,0 +1,26 @@
+FROM rust:1.94 AS builder
+WORKDIR /build
+
+# Copy workspace files
+COPY Cargo.toml .
+COPY types/ types/
+COPY gateway/ gateway/
+COPY client/ client/
+
+# Stub out other workspace members so cargo resolves the workspace
+RUN mkdir -p backend/src && echo "fn main(){}" > backend/src/main.rs
+COPY backend/Cargo.toml backend/Cargo.toml
+RUN mkdir -p service/src && echo "fn main(){}" > service/src/main.rs
+COPY service/Cargo.toml service/Cargo.toml
+RUN mkdir -p display-ctl/src && echo "fn main(){}" > display-ctl/src/main.rs
+COPY display-ctl/Cargo.toml display-ctl/Cargo.toml
+RUN mkdir -p session-manager/src && echo "fn main(){}" > session-manager/src/main.rs
+COPY session-manager/Cargo.toml session-manager/Cargo.toml
+
+RUN cargo build --release -p streamio-gateway
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/streamio-gateway /usr/local/bin/streamio-gateway
+EXPOSE 8080
+CMD ["streamio-gateway"]

@@ -19,6 +19,28 @@ use tracing::{error, info};
 
 const PKCE_TTL: u64 = 600; // 10 minutes
 
+/// Simple base64 decode (standard alphabet, with padding).
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = Vec::new();
+    let mut buf: u32 = 0;
+    let mut bits = 0;
+    for &b in input.as_bytes() {
+        if b == b'=' || b == b'\n' || b == b'\r' {
+            continue;
+        }
+        let val = TABLE.iter().position(|&c| c == b).ok_or(())?;
+        buf = (buf << 6) | val as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Ok(output)
+}
+
 pub struct OidcClient {
     client: CoreClient,
     redirect_uri: String,
@@ -157,12 +179,64 @@ pub async fn callback_handler(
         .map(|e| e.to_string())
         .unwrap_or_else(|| sub.clone());
 
-    // Determine role: check if sub is in ADMIN_SUBS
-    let role = if state.config.admin_subs.contains(&sub) {
-        Role::Admin
-    } else {
-        Role::User
+    // Determine role: check if sub or any group ID is in ADMIN_SUBS
+    // Entra ID includes group object IDs in the "groups" claim of the ID token.
+    // We decode the raw JWT to extract groups without needing extra API calls.
+    let groups: Vec<String> = {
+        let raw_jwt = id_token.to_string();
+        let parts: Vec<&str> = raw_jwt.split('.').collect();
+        if parts.len() >= 2 {
+            // Decode the payload (base64url)
+            use openidconnect::core::CoreJsonWebKey;
+            let payload = parts[1];
+            // Pad base64url to base64
+            let padded = match payload.len() % 4 {
+                2 => format!("{}==", payload),
+                3 => format!("{}=", payload),
+                _ => payload.to_string(),
+            };
+            let decoded = padded.replace('-', "+").replace('_', "/");
+            match openidconnect::url::Url::parse("data:;base64,") {
+                _ => {
+                    // Use standard base64 decoding
+                    if let Ok(bytes) = base64_decode(&decoded) {
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            val.get("groups")
+                                .and_then(|g| g.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        vec![]
+                    }
+                }
+            }
+        } else {
+            vec![]
+        }
     };
+
+    info!("Login: sub={sub}, email={email}, groups={groups:?}, admin_subs={:?}", state.config.admin_subs);
+
+    let is_admin = state.config.admin_subs.contains(&sub)
+        || groups.iter().any(|g| state.config.admin_subs.contains(g));
+    let role = if is_admin { Role::Admin } else { Role::User };
+
+    // Track user in known_users table (for admin assignment dropdown)
+    let _ = sqlx::query(
+        "INSERT INTO known_users (sub, email, last_login) VALUES ($1, $2, now())
+         ON CONFLICT (sub) DO UPDATE SET email = $2, last_login = now()",
+    )
+    .bind(&sub)
+    .bind(&email)
+    .execute(&state.db)
+    .await;
 
     // Look up existing backend assignment (if any)
     let backend_id = state.registry.get_assignment(&sub).await;
@@ -178,26 +252,34 @@ pub async fn callback_handler(
         }
     };
 
-    let cookie = Cookie::build((COOKIE_NAME, token))
+    let is_https = state.config.gateway_origin.starts_with("https");
+    let mut cookie_builder = Cookie::build((COOKIE_NAME, token))
         .http_only(true)
-        .same_site(SameSite::Lax) // Lax allows redirect from OIDC provider
-        .path("/")
-        .build();
+        .same_site(SameSite::Lax)
+        .path("/");
+    if is_https {
+        cookie_builder = cookie_builder.secure(true);
+    }
+    let cookie = cookie_builder.build();
 
     (
         axum_extra::extract::cookie::CookieJar::new().add(cookie),
-        Redirect::to("/"),
+        Redirect::to("/portal"),
     )
         .into_response()
 }
 
 /// GET /auth/logout — clear session cookie
-pub async fn logout_handler() -> Response {
-    // Set cookie with immediate expiry to clear it from the browser
-    let cookie = Cookie::build((COOKIE_NAME, ""))
+pub async fn logout_handler(State(state): State<AppState>) -> Response {
+    let is_https = state.config.gateway_origin.starts_with("https");
+    let mut cookie_builder = Cookie::build((COOKIE_NAME, ""))
         .http_only(true)
         .path("/")
-        .max_age(axum_extra::extract::cookie::time::Duration::ZERO)
+        .max_age(cookie::time::Duration::ZERO);
+    if is_https {
+        cookie_builder = cookie_builder.secure(true);
+    }
+    let cookie = cookie_builder
         .build();
 
     (

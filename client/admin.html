@@ -16,7 +16,16 @@
     header h1 { font-size: 16px; font-weight: 600; }
     header a { margin-left: auto; color: var(--muted); text-decoration: none; font-size: 13px; }
     header a:hover { color: var(--text); }
-    main { max-width: 1200px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 24px; }
+
+    /* Tab navigation */
+    .tabs { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 24px; display: flex; gap: 0; }
+    .tab { padding: 10px 20px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; transition: color .15s, border-color .15s; user-select: none; }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: flex; flex-direction: column; gap: 24px; }
+
+    main { max-width: 1200px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 0; }
     section { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
     section h2 { padding: 12px 16px; font-size: 14px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
     table { width: 100%; border-collapse: collapse; }
@@ -27,14 +36,50 @@
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
     .dot.green { background: var(--green); }
     .dot.red { background: var(--red); }
+    .dot.orange { background: var(--orange); }
     .btn { background: var(--border); border: none; color: var(--text); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
     .btn:hover { background: #3c4147; }
     .btn.danger { background: rgba(248,81,73,.15); color: var(--red); }
     .btn.danger:hover { background: rgba(248,81,73,.25); }
+    .btn.primary { background: rgba(88,166,255,.15); color: var(--accent); }
+    .btn.primary:hover { background: rgba(88,166,255,.25); }
     .empty { padding: 24px; text-align: center; color: var(--muted); }
     .mono { font-family: monospace; font-size: 12px; color: var(--muted); }
     .badge { display: inline-block; padding: 1px 7px; border-radius: 12px; font-size: 11px; font-weight: 500; background: var(--border); }
     .badge.admin { background: rgba(88,166,255,.15); color: var(--accent); }
+
+    /* Forms */
+    .form-row { display: flex; align-items: flex-end; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+    .form-group { display: flex; flex-direction: column; gap: 4px; }
+    .form-group label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .form-group input, .form-group select { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-size: 13px; font-family: inherit; outline: none; }
+    .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
+    .form-group input::placeholder { color: var(--border); }
+    .form-group select { cursor: pointer; }
+    .form-group.grow { flex: 1; min-width: 160px; }
+    .form-group input.mono-input { font-family: monospace; font-size: 12px; }
+
+    /* Status text */
+    .status-text { font-size: 12px; }
+    .status-text.healthy { color: var(--green); }
+    .status-text.unhealthy { color: var(--red); }
+    .status-text.active { color: var(--green); }
+    .status-text.inactive { color: var(--muted); }
+
+    /* Capacity bar */
+    .capacity { display: flex; align-items: center; gap: 8px; }
+    .capacity-bar { width: 60px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+    .capacity-fill { height: 100%; border-radius: 3px; transition: width .3s; }
+    .capacity-text { font-size: 12px; color: var(--muted); font-family: monospace; }
+
+    /* Duration */
+    .duration { font-size: 12px; color: var(--muted); font-family: monospace; }
+
+    /* Toast */
+    .toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 18px; border-radius: 6px; font-size: 13px; z-index: 100; opacity: 0; transition: opacity .3s; pointer-events: none; }
+    .toast.show { opacity: 1; }
+    .toast.success { background: rgba(63,185,80,.15); color: var(--green); border: 1px solid rgba(63,185,80,.3); }
+    .toast.error { background: rgba(248,81,73,.15); color: var(--red); border: 1px solid rgba(248,81,73,.3); }
   </style>
 </head>
 <body>
@@ -42,97 +87,531 @@
   <h1>Streamio Admin</h1>
   <a href="/auth/logout">Logout</a>
 </header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="hosts">Hosts</div>
+  <div class="tab" data-tab="users">Users</div>
+  <div class="tab" data-tab="sessions">Sessions</div>
+  <div class="tab" data-tab="backends">Legacy Backends</div>
+</div>
+
 <main>
 
-  <!-- Backends -->
-  <section>
-    <h2>Backends <span id="backend-count" class="badge"></span></h2>
-    <table>
-      <thead><tr><th>Status</th><th>Label</th><th>URL</th><th>ID</th></tr></thead>
-      <tbody id="backends-tbody"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
-    </table>
-  </section>
+  <!-- HOST MACHINES TAB -->
+  <div id="tab-hosts" class="tab-panel active">
+    <section>
+      <h2>Register Host</h2>
+      <div class="form-row">
+        <div class="form-group grow">
+          <label>URL</label>
+          <input type="text" id="host-url" placeholder="http://192.168.1.100:9100" class="mono-input">
+        </div>
+        <div class="form-group grow">
+          <label>Label</label>
+          <input type="text" id="host-label" placeholder="win11-test">
+        </div>
+        <div class="form-group">
+          <label>Platform</label>
+          <select id="host-platform">
+            <option value="windows">Windows</option>
+            <option value="linux">Linux</option>
+            <option value="macos">macOS</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Max Sessions</label>
+          <input type="number" id="host-max-sessions" value="5" min="1" max="100" style="width:70px">
+        </div>
+        <button class="btn primary" onclick="registerHost()">Register Host</button>
+      </div>
+    </section>
 
-  <!-- User Assignments -->
-  <section>
-    <h2>User Assignments <span id="user-count" class="badge"></span></h2>
-    <table>
-      <thead><tr><th>User</th><th>Backend</th><th>Actions</th></tr></thead>
-      <tbody id="users-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
-    </table>
-  </section>
+    <section>
+      <h2>Host Machines <span id="host-count" class="badge"></span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Label</th>
+            <th>URL</th>
+            <th>Platform</th>
+            <th>Capacity</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="hosts-tbody">
+          <tr><td colspan="6" class="empty">Loading...</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
 
-  <!-- Active Sessions -->
-  <section>
-    <h2>Active Sessions</h2>
-    <table>
-      <thead><tr><th>Backend</th><th>URL</th><th>Status</th></tr></thead>
-      <tbody id="sessions-tbody"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
-    </table>
-  </section>
+  <!-- USERS TAB -->
+  <div id="tab-users" class="tab-panel">
+    <section>
+      <h2>Assign User to Host</h2>
+      <div class="form-row">
+        <div class="form-group grow">
+          <label>User</label>
+          <select id="assign-user-sub">
+            <option value="">Select user...</option>
+          </select>
+        </div>
+        <div class="form-group grow">
+          <label>Host</label>
+          <select id="assign-host-id">
+            <option value="">Loading hosts...</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Priority</label>
+          <input type="number" id="assign-priority" value="0" min="0" max="100" style="width:70px">
+        </div>
+        <button class="btn primary" onclick="assignUser()">Assign</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>User Assignments <span id="user-count" class="badge"></span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>User Sub</th>
+            <th>Email</th>
+            <th>Assigned Hosts</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="users-tbody">
+          <tr><td colspan="4" class="empty">Loading...</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <!-- SESSIONS TAB -->
+  <div id="tab-sessions" class="tab-panel">
+    <section>
+      <h2>Active Sessions <span id="session-count" class="badge"></span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Session ID</th>
+            <th>User</th>
+            <th>Host</th>
+            <th>Port</th>
+            <th>OS User</th>
+            <th>Status</th>
+            <th>Duration</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-tbody">
+          <tr><td colspan="8" class="empty">Loading...</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <!-- LEGACY BACKENDS TAB -->
+  <div id="tab-backends" class="tab-panel">
+    <section>
+      <h2>Backends <span id="backend-count" class="badge"></span></h2>
+      <table>
+        <thead><tr><th>Status</th><th>Label</th><th>URL</th><th>ID</th></tr></thead>
+        <tbody id="backends-tbody"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Legacy User Assignments <span id="legacy-user-count" class="badge"></span></h2>
+      <table>
+        <thead><tr><th>User</th><th>Backend</th><th>Actions</th></tr></thead>
+        <tbody id="legacy-users-tbody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Legacy Sessions</h2>
+      <table>
+        <thead><tr><th>Backend</th><th>URL</th><th>Status</th></tr></thead>
+        <tbody id="legacy-sessions-tbody"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
+      </table>
+    </section>
+  </div>
 
 </main>
 
+<div id="toast" class="toast"></div>
+
 <script>
-const api = (path, opts) => fetch('/admin/api' + path, { headers: {'Content-Type':'application/json'}, ...opts }).then(r => r.json().catch(() => null));
+const api = (path, opts) => fetch('/admin/api' + path, {
+  headers: {'Content-Type':'application/json'}, ...opts
+}).then(r => {
+  if (!r.ok) return r.text().then(t => { throw new Error(t || r.statusText); });
+  return r.json().catch(() => null);
+});
+
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast ' + type + ' show';
+  clearTimeout(el._timeout);
+  el._timeout = setTimeout(() => el.classList.remove('show'), 3000);
+}
 
 function dot(healthy) {
-  return `<span class="dot ${healthy ? 'green' : 'red'}"></span>${healthy ? 'Healthy' : 'Unhealthy'}`;
+  return `<span class="dot ${healthy ? 'green' : 'red'}"></span>${healthy ? 'Healthy' : 'Offline'}`;
 }
 
-async function loadBackends() {
-  const data = await api('/backends');
-  const tbody = document.getElementById('backends-tbody');
-  document.getElementById('backend-count').textContent = data.length;
-  if (!data.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">No backends registered</td></tr>'; return; }
-  tbody.innerHTML = data.map(b => `
-    <tr>
-      <td>${dot(b.healthy)}</td>
-      <td>${b.label || '<span class="muted">—</span>'}</td>
-      <td class="mono">${b.url}</td>
-      <td class="mono">${b.id}</td>
-    </tr>`).join('');
+function escHtml(s) {
+  if (!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+
+function formatDuration(startedAt) {
+  if (!startedAt) return '--';
+  const ms = Date.now() - new Date(startedAt).getTime();
+  if (ms < 0) return '--';
+  const secs = Math.floor(ms / 1000);
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function capacityColor(ratio) {
+  if (ratio >= 0.9) return 'var(--red)';
+  if (ratio >= 0.7) return 'var(--orange)';
+  return 'var(--green)';
+}
+
+// ── Tab navigation ─────────────────────────────────────────────
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+  });
+});
+
+// ── Hosts ──────────────────────────────────────────────────────
+
+let hostsCache = [];
+
+async function loadHosts() {
+  try {
+    const data = await api('/hosts');
+    hostsCache = data || [];
+    const tbody = document.getElementById('hosts-tbody');
+    document.getElementById('host-count').textContent = hostsCache.length;
+    if (!hostsCache.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No hosts registered</td></tr>';
+      updateHostDropdown();
+      return;
+    }
+    tbody.innerHTML = hostsCache.map(h => {
+      const active = h.active_sessions || 0;
+      const max = h.max_sessions || 1;
+      const ratio = active / max;
+      const color = capacityColor(ratio);
+      return `<tr>
+        <td>${dot(h.healthy)}</td>
+        <td>${escHtml(h.label) || '<span style="color:var(--muted)">--</span>'}</td>
+        <td class="mono">${escHtml(h.url)}</td>
+        <td>${escHtml(h.platform) || '--'}</td>
+        <td>
+          <div class="capacity">
+            <div class="capacity-bar"><div class="capacity-fill" style="width:${ratio*100}%;background:${color}"></div></div>
+            <span class="capacity-text">${active}/${max}</span>
+          </div>
+        </td>
+        <td><button class="btn danger" onclick="removeHost('${escHtml(h.id)}')">Remove</button></td>
+      </tr>`;
+    }).join('');
+    updateHostDropdown();
+  } catch (e) {
+    console.error('loadHosts:', e);
+  }
+}
+
+function updateHostDropdown() {
+  const select = document.getElementById('assign-host-id');
+  if (!hostsCache.length) {
+    select.innerHTML = '<option value="">No hosts available</option>';
+    return;
+  }
+  select.innerHTML = hostsCache.map(h =>
+    `<option value="${escHtml(h.id)}">${escHtml(h.label || h.url)} (${escHtml(h.platform || '?')})</option>`
+  ).join('');
+}
+
+async function registerHost() {
+  const url = document.getElementById('host-url').value.trim();
+  const label = document.getElementById('host-label').value.trim();
+  const platform = document.getElementById('host-platform').value;
+  const maxSessions = parseInt(document.getElementById('host-max-sessions').value) || 5;
+  if (!url) { toast('URL is required', 'error'); return; }
+  try {
+    await api('/hosts', {
+      method: 'POST',
+      body: JSON.stringify({ url, label, platform, max_sessions: maxSessions })
+    });
+    document.getElementById('host-url').value = '';
+    document.getElementById('host-label').value = '';
+    toast('Host registered');
+    loadHosts();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function removeHost(id) {
+  if (!confirm('Remove this host?')) return;
+  try {
+    await fetch('/admin/api/hosts/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Host removed');
+    loadHosts();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+// ── Known Users dropdown ──────────────────────────────────────
+
+async function loadKnownUsers() {
+  try {
+    const users = await api('/known-users');
+    const select = document.getElementById('assign-user-sub');
+    if (!users.length) {
+      select.innerHTML = '<option value="">No users yet (users appear after first login)</option>';
+      return;
+    }
+    select.innerHTML = '<option value="">Select user...</option>' + users.map(u =>
+      `<option value="${escHtml(u.sub)}">${escHtml(u.email || u.sub)}</option>`
+    ).join('');
+  } catch (e) {
+    console.error('Failed to load known users:', e);
+  }
+}
+
+// ── User Assignments ───────────────────────────────────────────
 
 async function loadUsers() {
-  const [users, backends] = await Promise.all([api('/users'), api('/backends')]);
-  const tbody = document.getElementById('users-tbody');
-  document.getElementById('user-count').textContent = users.length;
-  if (!users.length) { tbody.innerHTML = '<tr><td colspan="3" class="empty">No assignments</td></tr>'; return; }
-  tbody.innerHTML = users.map(u => `
-    <tr>
-      <td class="mono">${u.user_sub}</td>
-      <td>${u.backend_label || u.backend_id || '—'}</td>
-      <td>
-        <button class="btn danger" onclick="deleteAssignment('${u.user_sub}')">Remove</button>
-      </td>
-    </tr>`).join('');
+  try {
+    const data = await api('/host-assignments');
+    const tbody = document.getElementById('users-tbody');
+    if (!data || !data.length) {
+      document.getElementById('user-count').textContent = '0';
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No assignments</td></tr>';
+      return;
+    }
+    // Group by user_sub
+    const grouped = {};
+    data.forEach(a => {
+      if (!grouped[a.user_sub]) grouped[a.user_sub] = { email: a.email || '', hosts: [] };
+      grouped[a.user_sub].hosts.push(a);
+    });
+    const subs = Object.keys(grouped);
+    document.getElementById('user-count').textContent = subs.length;
+    tbody.innerHTML = subs.map(sub => {
+      const u = grouped[sub];
+      const hostBadges = u.hosts.map(h =>
+        `<span class="badge" style="margin:2px">${escHtml(h.host_label || h.host_id)}` +
+        (h.priority ? ` <span style="color:var(--muted);font-size:10px">p${h.priority}</span>` : '') +
+        ` <span class="btn danger" style="padding:0 4px;margin-left:4px;font-size:10px;display:inline;cursor:pointer" onclick="removeAssignment('${escHtml(sub)}','${escHtml(h.host_id)}')">&times;</span></span>`
+      ).join(' ');
+      return `<tr>
+        <td class="mono">${escHtml(sub)}</td>
+        <td>${escHtml(u.email) || '<span style="color:var(--muted)">--</span>'}</td>
+        <td>${hostBadges}</td>
+        <td><button class="btn danger" onclick="removeAllAssignments('${escHtml(sub)}')">Remove All</button></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('loadUsers:', e);
+  }
 }
+
+async function assignUser() {
+  const userSub = document.getElementById('assign-user-sub').value.trim();
+  const hostId = document.getElementById('assign-host-id').value;
+  const priority = parseInt(document.getElementById('assign-priority').value) || 0;
+  if (!userSub) { toast('User sub is required', 'error'); return; }
+  if (!hostId) { toast('Select a host', 'error'); return; }
+  try {
+    await api('/host-assignments', {
+      method: 'POST',
+      body: JSON.stringify({ user_sub: userSub, host_id: hostId, priority })
+    });
+    document.getElementById('assign-user-sub').value = '';
+    toast('User assigned to host');
+    loadUsers();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function removeAssignment(sub, hostId) {
+  if (!confirm(`Remove assignment for ${sub} from host?`)) return;
+  try {
+    await fetch('/admin/api/host-assignments/' + encodeURIComponent(sub) + '/' + encodeURIComponent(hostId), { method: 'DELETE' });
+    toast('Assignment removed');
+    loadUsers();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+async function removeAllAssignments(sub) {
+  if (!confirm(`Remove all host assignments for ${sub}?`)) return;
+  const u = hostsCache; // just remove one by one from current data
+  try {
+    const data = await api('/host-assignments');
+    const userAssignments = (data || []).filter(a => a.user_sub === sub);
+    for (const a of userAssignments) {
+      await fetch('/admin/api/host-assignments/' + encodeURIComponent(sub) + '/' + encodeURIComponent(a.host_id), { method: 'DELETE' });
+    }
+    toast('All assignments removed');
+    loadUsers();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+// ── Active Sessions (VDI) ──────────────────────────────────────
 
 async function loadSessions() {
-  const data = await api('/sessions');
-  const tbody = document.getElementById('sessions-tbody');
-  if (!data || !data.length) { tbody.innerHTML = '<tr><td colspan="3" class="empty">No sessions</td></tr>'; return; }
-  tbody.innerHTML = data.map(s => `
-    <tr>
-      <td class="mono">${s.backend_id}</td>
-      <td class="mono">${s.backend_url}</td>
-      <td>${dot(s.active)}</td>
-    </tr>`).join('');
+  try {
+    const data = await api('/vdi-sessions');
+    const tbody = document.getElementById('sessions-tbody');
+    if (!data || !data.length) {
+      document.getElementById('session-count').textContent = '0';
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No active sessions</td></tr>';
+      return;
+    }
+    document.getElementById('session-count').textContent = data.length;
+    tbody.innerHTML = data.map(s => {
+      const statusDot = s.status === 'running'
+        ? '<span class="dot green"></span>Running'
+        : s.status === 'starting'
+        ? '<span class="dot orange"></span>Starting'
+        : '<span class="dot red"></span>' + escHtml(s.status || 'Unknown');
+      return `<tr>
+        <td class="mono" style="font-size:11px">${escHtml(s.session_id || s.id)}</td>
+        <td>${escHtml(s.user_id || s.user_sub || '--')}</td>
+        <td>${escHtml(s.host_label || s.host_id || '--')}</td>
+        <td class="mono">${s.port || '--'}</td>
+        <td class="mono">${escHtml(s.os_user || '--')}</td>
+        <td>${statusDot}</td>
+        <td class="duration">${formatDuration(s.started_at || s.created_at)}</td>
+        <td><button class="btn danger" onclick="killSession('${escHtml(s.session_id || s.id)}')">Kill</button></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('loadSessions:', e);
+  }
 }
 
-async function deleteAssignment(sub) {
+async function killSession(id) {
+  if (!confirm('Kill this session? The user will be disconnected.')) return;
+  try {
+    await fetch('/admin/api/vdi-sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+    toast('Session terminated');
+    loadSessions();
+  } catch (e) {
+    toast('Failed: ' + e.message, 'error');
+  }
+}
+
+// ── Legacy Backends ────────────────────────────────────────────
+
+async function loadBackends() {
+  try {
+    const data = await api('/backends');
+    const tbody = document.getElementById('backends-tbody');
+    document.getElementById('backend-count').textContent = (data || []).length;
+    if (!data || !data.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No backends registered</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(b => `
+      <tr>
+        <td>${dot(b.healthy)}</td>
+        <td>${escHtml(b.label) || '<span style="color:var(--muted)">--</span>'}</td>
+        <td class="mono">${escHtml(b.url)}</td>
+        <td class="mono">${escHtml(b.id)}</td>
+      </tr>`).join('');
+  } catch (e) {
+    console.error('loadBackends:', e);
+  }
+}
+
+async function loadLegacyUsers() {
+  try {
+    const users = await api('/users');
+    const tbody = document.getElementById('legacy-users-tbody');
+    document.getElementById('legacy-user-count').textContent = (users || []).length;
+    if (!users || !users.length) {
+      tbody.innerHTML = '<tr><td colspan="3" class="empty">No assignments</td></tr>';
+      return;
+    }
+    tbody.innerHTML = users.map(u => `
+      <tr>
+        <td class="mono">${escHtml(u.user_sub)}</td>
+        <td>${escHtml(u.backend_label || u.backend_id) || '--'}</td>
+        <td><button class="btn danger" onclick="deleteLegacyAssignment('${escHtml(u.user_sub)}')">Remove</button></td>
+      </tr>`).join('');
+  } catch (e) {
+    console.error('loadLegacyUsers:', e);
+  }
+}
+
+async function loadLegacySessions() {
+  try {
+    const data = await api('/sessions');
+    const tbody = document.getElementById('legacy-sessions-tbody');
+    if (!data || !data.length) {
+      tbody.innerHTML = '<tr><td colspan="3" class="empty">No sessions</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(s => `
+      <tr>
+        <td class="mono">${escHtml(s.backend_id)}</td>
+        <td class="mono">${escHtml(s.backend_url)}</td>
+        <td>${dot(s.active)}</td>
+      </tr>`).join('');
+  } catch (e) {
+    console.error('loadLegacySessions:', e);
+  }
+}
+
+async function deleteLegacyAssignment(sub) {
   if (!confirm(`Remove assignment for ${sub}?`)) return;
   await fetch('/admin/api/assignments/' + encodeURIComponent(sub), { method: 'DELETE' });
-  loadUsers();
+  loadLegacyUsers();
 }
 
+// ── Refresh ────────────────────────────────────────────────────
+
 async function refresh() {
-  await Promise.all([loadBackends(), loadUsers(), loadSessions()]);
+  await Promise.all([
+    loadHosts(),
+    loadKnownUsers(),
+    loadUsers(),
+    loadSessions(),
+    loadBackends(),
+    loadLegacyUsers(),
+    loadLegacySessions()
+  ]);
 }
 
 refresh();
-setInterval(refresh, 15000);
+setInterval(refresh, 10000);
 </script>
 </body>
 </html>

@@ -67,6 +67,7 @@ typedef struct _MONITOR_CONTEXT {
     HANDLE swapchain_event;
     HANDLE swapchain_thread;
     volatile BOOLEAN stop_thread;
+    ID3D11Device* d3d_device;  /* Per-monitor D3D device (each swapchain needs its own) */
 } MONITOR_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(MONITOR_CONTEXT, GetMonitorContext)
@@ -244,6 +245,16 @@ static ID3D11Device* GetOrCreateD3DDevice()
     if (g_d3d_device) return g_d3d_device;
 
     /* If we know which adapter works, use it directly */
+    if (g_working_adapter_index == 99) {
+        /* WARP was the last working adapter */
+        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
+        D3D_FEATURE_LEVEL level_out;
+        D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            levels, 1, D3D11_SDK_VERSION,
+            &g_d3d_device, &level_out, nullptr);
+        return g_d3d_device;
+    }
     if (g_working_adapter_index >= 0) {
         g_d3d_device = CreateD3DDeviceOnAdapter(g_working_adapter_index);
         return g_d3d_device;
@@ -366,6 +377,7 @@ static DWORD WINAPI SwapchainThread(LPVOID param)
     DriverLog("SwapchainThread: started for monitor %u", ctx->display_id);
 
     __try {
+        UINT32 error_count = 0;
         while (!ctx->stop_thread) {
             if (!ctx->swapchain_event || !ctx->swapchain) {
                 Sleep(100);
@@ -384,14 +396,36 @@ static DWORD WINAPI SwapchainThread(LPVOID param)
             NTSTATUS status = IddCxSwapChainReleaseAndAcquireBuffer(sc, &buf_out);
             if (NT_SUCCESS(status)) {
                 IddCxSwapChainFinishedProcessingFrame(sc);
+                error_count = 0;
             } else if (status == STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN) {
                 DriverLog("SwapchainThread: swapchain abandoned for monitor %u", ctx->display_id);
                 break;
+            } else {
+                error_count++;
+                if (error_count <= 3) {
+                    DriverLog("SwapchainThread: error 0x%08X on monitor %u (attempt %u)",
+                              status, ctx->display_id, error_count);
+                }
+                /* For DXGI device-removed (0x887A0026) — the GPU was reset.
+                 * Sleep longer and let IddCx reassign the swapchain naturally.
+                 * Don't treat this as fatal — just idle until the swapchain
+                 * is unassigned/reassigned by the framework. */
+                if (error_count > 50) {
+                    DriverLog("SwapchainThread: persistent errors on monitor %u, idling",
+                              ctx->display_id);
+                    /* Don't break — just idle. Breaking causes the thread to
+                     * exit which UMDF may interpret as a crash. */
+                    Sleep(500);
+                    error_count = 10; /* prevent log spam but keep looping */
+                } else {
+                    Sleep(16); /* ~60fps pacing */
+                }
             }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        DriverLog("SwapchainThread: EXCEPTION 0x%08X in monitor %u", GetExceptionCode(), ctx->display_id);
+        DriverLog("SwapchainThread: EXCEPTION 0x%08X in monitor %u (handled, not crashing)",
+                  GetExceptionCode(), ctx->display_id);
     }
 
     DriverLog("SwapchainThread: exiting for monitor %u", ctx->display_id);
@@ -607,74 +641,74 @@ NTSTATUS EvtMonitorAssignSwapChain(
 
     DriverLog("AssignSwapChain: monitor=%u swapchain=%p", ctx->display_id, args->hSwapChain);
 
-    /* Try to set the D3D device on the swapchain.
-     * IddCx requires the device on the correct render adapter.
-     * If the current device fails, try each adapter until one works. */
+    /* Each swapchain needs its OWN D3D device — IddCx rejects a device
+     * already bound to another swapchain. Create a fresh device per monitor.
+     * Try known-good adapter index first, then scan all, then WARP. */
     BOOLEAN device_set = FALSE;
+    ID3D11Device* dev = nullptr;
 
-    for (int attempt = 0; attempt < 2 && !device_set; attempt++) {
-        ID3D11Device* dev = GetOrCreateD3DDevice();
-        if (!dev) {
-            DriverLog("AssignSwapChain: D3D device creation failed");
-            break;
-        }
+    /* Helper lambda-like: try a device on the swapchain */
+    #define TRY_SET_DEVICE(d3ddev, label) do { \
+        IDXGIDevice* dxgi_dev = nullptr; \
+        (d3ddev)->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev); \
+        if (dxgi_dev) { \
+            IDARG_IN_SWAPCHAINSETDEVICE sd = {}; \
+            sd.pDevice = dxgi_dev; \
+            NTSTATUS st2 = IddCxSwapChainSetDevice(args->hSwapChain, &sd); \
+            dxgi_dev->Release(); \
+            if (NT_SUCCESS(st2)) { \
+                DriverLog("AssignSwapChain: SUCCESS on %s", label); \
+                device_set = TRUE; \
+            } else { \
+                DriverLog("AssignSwapChain: %s failed: 0x%08X", label, st2); \
+                (d3ddev)->Release(); (d3ddev) = nullptr; \
+            } \
+        } \
+    } while(0)
 
-        IDXGIDevice* dxgi_dev = nullptr;
-        HRESULT hr = dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev);
-        if (FAILED(hr) || !dxgi_dev) {
-            DriverLog("AssignSwapChain: QueryInterface(IDXGIDevice) failed: 0x%08X", hr);
-            break;
-        }
-
-        IDARG_IN_SWAPCHAINSETDEVICE set_dev = {};
-        set_dev.pDevice = dxgi_dev;
-        NTSTATUS st = IddCxSwapChainSetDevice(args->hSwapChain, &set_dev);
-        dxgi_dev->Release();
-
-        if (NT_SUCCESS(st)) {
-            DriverLog("AssignSwapChain: device set successfully (adapter %d)", g_working_adapter_index);
-            device_set = TRUE;
-        } else {
-            DriverLog("AssignSwapChain: IddCxSwapChainSetDevice failed: 0x%08X (adapter %d), trying next",
-                      st, g_working_adapter_index);
-            /* Release current device and try next adapter */
-            g_d3d_device->Release();
-            g_d3d_device = nullptr;
-            g_working_adapter_index++;
+    /* Phase 1: Try known-good adapter */
+    if (!device_set && g_working_adapter_index >= 0 && g_working_adapter_index < 90) {
+        dev = CreateD3DDeviceOnAdapter(g_working_adapter_index);
+        if (dev) {
+            char label[64]; _snprintf_s(label, sizeof(label), _TRUNCATE, "known adapter %d", g_working_adapter_index);
+            TRY_SET_DEVICE(dev, label);
         }
     }
 
-    /* If first round didn't work, try all remaining adapters */
+    /* Phase 2: Try all hardware adapters */
     if (!device_set) {
-        int start = (g_working_adapter_index >= 0) ? g_working_adapter_index : 0;
-        for (int i = start; i < 8 && !device_set; i++) {
-            if (g_d3d_device) { g_d3d_device->Release(); g_d3d_device = nullptr; }
-            g_d3d_device = CreateD3DDeviceOnAdapter(i);
-            if (!g_d3d_device) continue;
-
-            IDXGIDevice* dxgi_dev = nullptr;
-            HRESULT hr = g_d3d_device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev);
-            if (FAILED(hr) || !dxgi_dev) continue;
-
-            IDARG_IN_SWAPCHAINSETDEVICE set_dev = {};
-            set_dev.pDevice = dxgi_dev;
-            NTSTATUS st = IddCxSwapChainSetDevice(args->hSwapChain, &set_dev);
-            dxgi_dev->Release();
-
-            if (NT_SUCCESS(st)) {
-                g_working_adapter_index = i;
-                DriverLog("AssignSwapChain: SUCCESS on adapter %d", i);
-                device_set = TRUE;
-            } else {
-                DriverLog("AssignSwapChain: adapter %d failed: 0x%08X", i, st);
-            }
+        for (int i = 0; i < 8 && !device_set; i++) {
+            dev = CreateD3DDeviceOnAdapter(i);
+            if (!dev) continue;
+            char label[64]; _snprintf_s(label, sizeof(label), _TRUNCATE, "adapter %d", i);
+            TRY_SET_DEVICE(dev, label);
+            if (device_set) g_working_adapter_index = i;
         }
     }
+
+    /* Phase 3: WARP */
+    if (!device_set) {
+        DriverLog("AssignSwapChain: trying WARP");
+        D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
+        D3D_FEATURE_LEVEL level_out;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 1, D3D11_SDK_VERSION,
+            &dev, &level_out, nullptr);
+        if (SUCCEEDED(hr) && dev) {
+            TRY_SET_DEVICE(dev, "WARP");
+            if (device_set) g_working_adapter_index = 99;
+        }
+    }
+
+    #undef TRY_SET_DEVICE
 
     if (!device_set) {
         DriverLog("AssignSwapChain: all adapters failed, swapchain will not process frames");
         return STATUS_SUCCESS;
     }
+
+    /* Store the per-monitor device so we can release it on unassign */
+    ctx->d3d_device = dev;
 
     ctx->swapchain = args->hSwapChain;
     ctx->swapchain_event = args->hNextSurfaceAvailable;
@@ -701,6 +735,10 @@ NTSTATUS EvtMonitorUnassignSwapChain(IDDCX_MONITOR monitor)
     }
     ctx->swapchain = nullptr;
     ctx->swapchain_event = nullptr;
+    if (ctx->d3d_device) {
+        ctx->d3d_device->Release();
+        ctx->d3d_device = nullptr;
+    }
 
     return STATUS_SUCCESS;
 }
@@ -749,6 +787,7 @@ static NTSTATUS CreateMonitorOnAdapter(DEVICE_CONTEXT* ctx, UINT32 slot,
     mon_ctx->swapchain_event = nullptr;
     mon_ctx->swapchain_thread = nullptr;
     mon_ctx->stop_thread = FALSE;
+    mon_ctx->d3d_device = nullptr;
 
     IDARG_OUT_MONITORARRIVAL arrival_out = {};
     status = IddCxMonitorArrival(create_out.MonitorObject, &arrival_out);
