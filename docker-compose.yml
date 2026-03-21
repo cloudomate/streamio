@@ -33,16 +33,17 @@ services:
     environment:
       DATABASE_URL: postgres://streamio:streamio@postgres/streamio
       REDIS_URL: redis://redis/
-      JWT_SECRET: "${JWT_SECRET:-streamio-jwt-secret-change-in-prod}"
-      # Entra ID (Azure AD) OIDC
-      OIDC_ISSUER_URL: "https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0"
+      JWT_SECRET: "${JWT_SECRET:-change-me-in-production}"
+      # OIDC provider (Entra ID, Google, Okta, etc.)
+      OIDC_ISSUER_URL: "${OIDC_ISSUER_URL}"
       OIDC_CLIENT_ID: "${OIDC_CLIENT_ID}"
       OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET}"
-      OIDC_REDIRECT_URI: "${GATEWAY_ORIGIN}/auth/callback"
+      OIDC_REDIRECT_URI: "${OIDC_REDIRECT_URI:-http://localhost:8080/auth/callback}"
       GATEWAY_PORT: "8080"
-      GATEWAY_ORIGIN: "${GATEWAY_ORIGIN}"
-      ADMIN_SUBS: "${ADMIN_GROUP_ID}"
-      RUST_LOG: "streamio_gateway=debug,tower_http=debug"
+      GATEWAY_ORIGIN: "${GATEWAY_ORIGIN:-http://localhost:8080}"
+      # Comma-separated OIDC subject IDs or group IDs with admin role
+      ADMIN_SUBS: "${ADMIN_SUBS:-}"
+      RUST_LOG: "${RUST_LOG:-streamio_gateway=info,tower_http=info}"
 
 volumes:
   postgres_data:
